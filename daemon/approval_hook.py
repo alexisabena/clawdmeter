@@ -8,12 +8,12 @@ from pathlib import Path
 ESP32_IP_FILE = Path(os.path.expanduser("~/.claude")) / "clawdmeter_ip.txt"
 RESPONSE_TIMEOUT = 10.0  # seconds to wait for approval from Clawdmeter
 
-# Only prompt for these dangerous tools. Read-only/utility tools are auto-approved.
+# Only prompt for these dangerous tools in Claude Code.
+# All other tools (like Grep, Glob, View) are auto-approved instantly.
 DANGER_TOOLS = {
-    "run_command",
-    "write_to_file",
-    "replace_file_content",
-    "multi_replace_file_content",
+    "Bash",
+    "Write",
+    "Edit",
 }
 
 
@@ -38,36 +38,25 @@ def main():
     except Exception:
         event_data = {}
 
-    # Debug log the incoming event payload to inspect structure
-    try:
-        log_dir = Path(os.path.expanduser("~/AppData/Local/Clawdmeter"))
-        log_dir.mkdir(parents=True, exist_ok=True)
-        debug_file = log_dir / "hook_debug.json"
-        debug_file.write_text(
-            json.dumps({"raw": raw_input, "parsed": event_data}, indent=2),
-            encoding="utf-8"
-        )
-    except Exception:
-        pass
-
-    # Extract tool/command details
-    tool_name = event_data.get("tool", "unknown")
-    arguments = event_data.get("arguments", {})
+    # Extract tool name using Claude Code's exact keys
+    tool_name = event_data.get("tool_name", "unknown")
+    tool_input = event_data.get("tool_input", {})
     
-    # 2. Safe bypass: Auto-approve any non-danger tools instantly
+    # 2. Safe bypass: Auto-approve any non-danger tools instantly (no chimes/popups)
     if tool_name not in DANGER_TOOLS:
         sys.exit(0)
 
     # 3. Format a descriptive message based on the tool type
     msg = ""
-    if tool_name == "run_command":
-        cmd = arguments.get("CommandLine") or arguments.get("command") or event_data.get("command") or ""
-        # Strip path or keep short
-        msg = f"Run: {cmd[:25]}" if cmd else "Run command"
-    elif tool_name in ("write_to_file", "replace_file_content", "multi_replace_file_content"):
-        filepath = arguments.get("TargetFile") or arguments.get("path") or ""
+    if tool_name == "Bash":
+        cmd = tool_input.get("command", "")
+        # Strip trailing/leading spaces and format
+        cmd_clean = cmd.strip()
+        msg = f"Run: {cmd_clean[:25]}" if cmd_clean else "Run command"
+    elif tool_name in ("Write", "Edit"):
+        filepath = tool_input.get("path", "")
         filename = Path(filepath).name if filepath else ""
-        action = "Write" if tool_name == "write_to_file" else "Edit"
+        action = "Write" if tool_name == "Write" else "Edit"
         msg = f"{action}: {filename[:25]}" if filename else f"{action} file"
     else:
         msg = f"Tool: {tool_name}"
