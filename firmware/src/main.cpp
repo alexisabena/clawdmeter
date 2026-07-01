@@ -6,7 +6,7 @@
 
 #include "data.h"
 #include "ui.h"
-#include "ble.h"
+#include "net_server.h"
 #include "splash.h"
 #include "usage_rate.h"
 #include "idle.h"
@@ -106,13 +106,29 @@ static bool parse_json(const char* json, UsageData* out) {
         return false;
     }
 
-    out->session_pct = doc["s"] | 0.0f;
-    out->session_reset_mins = doc["sr"] | -1;
-    out->weekly_pct = doc["w"] | 0.0f;
-    out->weekly_reset_mins = doc["wr"] | -1;
-    strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
+    // Parse Claude fields
+    out->claude.session_pct = doc["c_s"] | 0.0f;
+    out->claude.session_reset_mins = doc["c_sr"] | -1;
+    out->claude.weekly_pct = doc["c_w"] | 0.0f;
+    out->claude.weekly_reset_mins = doc["c_wr"] | -1;
+    strlcpy(out->claude.status, doc["c_st"] | "unknown", sizeof(out->claude.status));
+    out->claude.valid = doc.containsKey("c_s");
+
+    // Parse Gemini fields
+    out->gemini.session_pct = doc["g_s"] | 0.0f;
+    out->gemini.session_reset_mins = doc["g_sr"] | -1;
+    out->gemini.weekly_pct = doc["g_w"] | 0.0f;
+    out->gemini.weekly_reset_mins = doc["g_wr"] | -1;
+    strlcpy(out->gemini.status, doc["g_st"] | "unknown", sizeof(out->gemini.status));
+    out->gemini.valid = doc.containsKey("g_s");
+
+    // Parse agent state
+    out->agent_state = doc["a_st"] | 0;
+    strlcpy(out->agent_msg, doc["a_msg"] | "", sizeof(out->agent_msg));
+
+    // General fields
     out->chime = doc["c"] | false;   // absent (old daemon / chime off) → stay silent
-    const char* acct = doc["acct"] | "pro";
+    const char* acct = doc["c_acct"] | "pro";
     out->enterprise = (strcmp(acct, "ent") == 0);
     out->time_pct = doc["tp"] | 0;
     out->period_days = doc["pd"] | 30;
@@ -189,8 +205,9 @@ extern "C" void board_init(void);
 
 void setup() {
     Serial.begin(115200);
-    delay(300);
+    delay(3000);  // wait for USB-CDC monitor to reconnect after reset
     Serial.println("{\"ready\":true}");
+    Serial.println("=== Clawdmeter Boot ===");
 
     board_init();
 
@@ -225,19 +242,19 @@ void setup() {
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touch_cb);
 
-    ble_init();
+    net_init();
     input_hal_init();
 
     ui_init();
-    ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
+    ui_update_net_status(net_get_state(), net_get_device_name(), net_get_ip_address());
     ui_update_battery(power_hal_battery_pct(), power_hal_is_charging());
     ui_show_screen(SCREEN_SPLASH);
 
-    Serial.printf("Dashboard ready (%s, %dx%d), waiting for data on BLE...\n",
+    Serial.printf("Dashboard ready (%s, %dx%d), waiting for data on Wi-Fi...\n",
         board_caps().name, W, H);
 }
 
-static ble_state_t last_ble_state = BLE_STATE_INIT;
+static net_state_t last_net_state = NET_STATE_INIT;
 
 // Hold-to-pair gesture: hold the PWR button ~3s, then RELEASE → clear all BLE
 // bonds and re-advertise. Clearing on *release* (not while held) is deliberate:
@@ -267,7 +284,7 @@ static void pair_tick(void) {
     if (power_hal_pwr_released()) {
         if (pair_state == PAIR_ARMED) {
             Serial.println("Pair: released in window — clearing bonds, advertising");
-            ble_clear_bonds();
+            net_clear_bonds();
         } else {
             Serial.println("Pair: released too early — cancelled");
         }
@@ -289,7 +306,7 @@ void loop() {
     idle_tick();
     lv_timer_handler();
     ui_tick_anim();
-    ble_tick();
+    net_tick();
     power_hal_tick();
     imu_hal_tick();
     sound_hal_tick();
@@ -315,10 +332,9 @@ void loop() {
         if (primary_now != primary_was) {
             if (primary_now) {
                 if (idle_consume_wake_press()) primary_wake_swallowed = true;
-                else                            ble_keyboard_press(0x2C, 0);  // HID Space, no mods
+                else                            ui_cycle_model();
             } else {
                 if (primary_wake_swallowed) primary_wake_swallowed = false;
-                else                        ble_keyboard_release();
             }
             primary_was = primary_now;
         }
@@ -330,10 +346,9 @@ void loop() {
             if (secondary_now != secondary_was) {
                 if (secondary_now) {
                     if (idle_consume_wake_press()) secondary_wake_swallowed = true;
-                    else                            ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
+                    else                            ui_toggle_splash();
                 } else {
                     if (secondary_wake_swallowed) secondary_wake_swallowed = false;
-                    else                          ble_keyboard_release();
                 }
                 secondary_was = secondary_now;
             }
@@ -348,13 +363,12 @@ void loop() {
             }
         }
 
-        pair_tick();
     }
 
-    ble_state_t bs = ble_get_state();
-    if (bs != last_ble_state) {
-        last_ble_state = bs;
-        ui_update_ble_status(bs, ble_get_device_name(), ble_get_mac_address());
+    net_state_t ns = net_get_state();
+    if (ns != last_net_state) {
+        last_net_state = ns;
+        ui_update_net_status(ns, net_get_device_name(), net_get_ip_address());
     }
 
     static int  last_pct      = -2;
@@ -369,13 +383,14 @@ void loop() {
 
     check_serial_cmd();
 
-    if (ble_has_data()) {
-        if (parse_json(ble_get_data(), &usage)) {
+    if (net_has_data()) {
+        if (parse_json(net_get_data(), &usage)) {
+            float active_session_pct = (ui_get_active_model() == 0) ? usage.claude.session_pct : usage.gemini.session_pct;
             int g_before = usage_rate_group();
-            bool session_reset = usage_rate_sample(usage.session_pct);
+            bool session_reset = usage_rate_sample(active_session_pct);
             int g_after = usage_rate_group();
             // 5-hour session limit refilled → chime so the user knows they can
-            // use Claude again (no-op on boards without a buzzer). Gated on the
+            // use the model again (no-op on boards without a buzzer). Gated on the
             // daemon's opt-in `chime` config; the `buzz` serial cmd ignores it.
             if (session_reset && usage.chime) {
                 Serial.println("session reset detected — chime");
@@ -383,13 +398,13 @@ void loop() {
             }
             if (g_after != g_before) {
                 Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
-                    g_before, g_after, usage.session_pct);
+                    g_before, g_after, active_session_pct);
                 if (splash_is_active()) splash_pick_for_current_rate();
             }
             ui_update(&usage);
-            ble_send_ack();
+            net_send_ack();
         } else {
-            ble_send_nack();
+            net_send_nack();
         }
     }
 

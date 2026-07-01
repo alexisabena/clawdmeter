@@ -27,10 +27,11 @@ from bleak.exc import BleakError
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
+TX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000003"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
-TICK = 5
+TICK = 1
 SCAN_TIMEOUT = 8.0
 CONNECT_TIMEOUT = 20.0
 
@@ -360,9 +361,183 @@ def add_clock_fields(payload: dict) -> None:
     clock = read_clock_setting()
     if clock == "off":
         return
-    tf = 24 if clock == "24" else 12 if clock == "12" else detect_hour_format()
-    payload["t"] = int(time.time()) + time.localtime().tm_gmtoff
     payload["tf"] = tf
+
+
+def read_gemini_api_key() -> str | None:
+    if key := os.environ.get("GEMINI_API_KEY"):
+        return key.strip()
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip().lower() == "gemini_api_key":
+                    return v.strip()
+    except OSError:
+        pass
+    return None
+
+
+def read_gemini_project_id() -> str | None:
+    if pid := os.environ.get("GEMINI_PROJECT_ID"):
+        return pid.strip()
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip().lower() == "gemini_project_id":
+                    return v.strip()
+    except OSError:
+        pass
+    return None
+
+
+async def poll_gemini_usage(api_key: str, project_id: str) -> dict | None:
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    start_dt = now_dt - datetime.timedelta(minutes=15)
+    
+    start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    
+    url = f"https://monitoring.googleapis.com/v3/projects/{project_id}/timeSeries"
+    
+    params_use = {
+        "filter": 'metric.type = "serviceruntime.googleapis.com/quota/rate/use"',
+        "interval.startTime": start_str,
+        "interval.endTime": end_str,
+        "key": api_key
+    }
+    params_limit = {
+        "filter": 'metric.type = "serviceruntime.googleapis.com/quota/limit"',
+        "interval.startTime": start_str,
+        "interval.endTime": end_str,
+        "key": api_key
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            resp_use = await http.get(url, params=params_use)
+            resp_limit = await http.get(url, params=params_limit)
+    except httpx.HTTPError as e:
+        log(f"Gemini Monitoring API call failed: {e}")
+        return None
+        
+    if resp_use.status_code != 200 or resp_limit.status_code != 200:
+        log(f"Gemini API returned error status. Use: {resp_use.status_code}, Limit: {resp_limit.status_code}")
+        return None
+        
+    try:
+        use_json = resp_use.json()
+        limit_json = resp_limit.json()
+    except Exception as e:
+        log(f"Failed to parse Gemini monitoring JSON: {e}")
+        return None
+
+    def extract_latest_values(data: dict) -> dict:
+        metrics = {}
+        for ts in data.get("timeSeries", []):
+            qm = ts.get("metric", {}).get("labels", {}).get("quota_metric")
+            if not qm or not qm.startswith("generativelanguage.googleapis.com/"):
+                continue
+            points = ts.get("points", [])
+            if not points:
+                continue
+            latest_point = points[0]
+            val_dict = latest_point.get("value", {})
+            val = 0.0
+            if "int64Value" in val_dict:
+                val = float(val_dict["int64Value"])
+            elif "doubleValue" in val_dict:
+                val = float(val_dict["doubleValue"])
+            metrics[qm] = val
+        return metrics
+
+    use_metrics = extract_latest_values(use_json)
+    limit_metrics = extract_latest_values(limit_json)
+    
+    rpm_metric = "generativelanguage.googleapis.com/generate_content_free_tier_requests"
+    rpm_paid_metric = "generativelanguage.googleapis.com/generate_content_requests"
+    rpm_use = use_metrics.get(rpm_metric) or use_metrics.get(rpm_paid_metric) or 0.0
+    rpm_limit = limit_metrics.get(rpm_metric) or limit_metrics.get(rpm_paid_metric) or 15.0
+    
+    tpm_metric = "generativelanguage.googleapis.com/generate_content_free_tier_input_token_count"
+    tpm_paid_metric = "generativelanguage.googleapis.com/generate_content_input_token_count"
+    tpm_use = use_metrics.get(tpm_metric) or use_metrics.get(tpm_paid_metric) or 0.0
+    tpm_limit = limit_metrics.get(tpm_metric) or limit_metrics.get(tpm_paid_metric) or 1000000.0
+    
+    rpd_metric = "generativelanguage.googleapis.com/generate_content_requests_per_day"
+    rpd_use = use_metrics.get(rpd_metric) or 0.0
+    rpd_limit = limit_metrics.get(rpd_metric) or 1500.0
+    
+    rpm_pct = int(round((rpm_use / rpm_limit * 100.0))) if rpm_limit > 0 else 0
+    tpm_pct = int(round((tpm_use / tpm_limit * 100.0))) if tpm_limit > 0 else 0
+    rpd_pct = int(round((rpd_use / rpd_limit * 100.0))) if rpd_limit > 0 else 0
+    
+    session_pct = max(rpm_pct, tpm_pct)
+    weekly_pct = rpd_pct
+    
+    seconds_to_midnight = ((24 - now_dt.hour - 1) * 3600) + ((60 - now_dt.minute - 1) * 60) + (60 - now_dt.second)
+    rpd_reset_mins = max(0, int(seconds_to_midnight / 60))
+    
+    return {
+        "s": min(100, max(0, session_pct)),
+        "sr": 1,
+        "w": min(100, max(0, weekly_pct)),
+        "wr": rpd_reset_mins,
+        "st": "allowed",
+        "ok": True
+    }
+
+
+def build_ble_payload(claude_payload: dict | None, gemini_payload: dict | None, agent_state: int = 0, agent_msg: str = "") -> dict:
+    payload = {"ok": False}
+    payload["a_st"] = agent_state
+    if agent_msg:
+        payload["a_msg"] = agent_msg[:32]
+
+    if claude_payload and claude_payload.get("ok"):
+        payload["ok"] = True
+        payload["c_s"] = claude_payload.get("s", 0)
+        payload["c_sr"] = claude_payload.get("sr", 0)
+        payload["c_w"] = claude_payload.get("w", 0)
+        payload["c_wr"] = claude_payload.get("wr", 0)
+        payload["c_st"] = claude_payload.get("st", "unknown")
+        payload["c_acct"] = claude_payload.get("acct", "pro")
+        if "c" in claude_payload:
+            payload["c"] = claude_payload["c"]
+        if "t" in claude_payload:
+            payload["t"] = claude_payload["t"]
+        if "tf" in claude_payload:
+            payload["tf"] = claude_payload["tf"]
+    else:
+        payload["c_s"] = 0
+        payload["c_sr"] = 0
+        payload["c_w"] = 0
+        payload["c_wr"] = 0
+        payload["c_st"] = "error"
+        payload["c_acct"] = "pro"
+
+    if gemini_payload and gemini_payload.get("ok"):
+        payload["ok"] = True
+        payload["g_s"] = gemini_payload.get("s", 0)
+        payload["g_sr"] = gemini_payload.get("sr", 0)
+        payload["g_w"] = gemini_payload.get("w", 0)
+        payload["g_wr"] = gemini_payload.get("wr", 0)
+        payload["g_st"] = gemini_payload.get("st", "unknown")
+    else:
+        payload["g_s"] = 0
+        payload["g_sr"] = 0
+        payload["g_w"] = 0
+        payload["g_wr"] = 0
+        payload["g_st"] = "disabled" if not (read_gemini_api_key() and read_gemini_project_id()) else "error"
+        
+    return payload
 
 
 async def poll_api(token: str) -> dict | None:
@@ -461,196 +636,75 @@ def _billing_period_info(now: float, reset_ts: str) -> dict:
     }
 
 
-class Session:
-    def __init__(self, client: BleakClient) -> None:
-        self.client = client
-        self.refresh_requested = asyncio.Event()
-
-    def _on_refresh(self, _char, _data: bytearray) -> None:
-        log("Refresh requested by device")
-        self.refresh_requested.set()
-
-    async def setup_refresh_subscription(self) -> None:
-        # start_notify awaits CoreBluetooth's CCCD-write confirmation, which
-        # never arrives if the peripheral doesn't ACK the subscribe (a
-        # half-open link after the OS auto-connects the HID). Unbounded, that
-        # await wedges the whole daemon between "Connected" and the first poll
-        # — the device then shows nothing until a manual restart. Bound it: the
-        # subscription is only an optional device-initiated refresh nudge (we
-        # poll every POLL_INTERVAL regardless), so on timeout we proceed.
-        try:
-            await asyncio.wait_for(
-                self.client.start_notify(REQ_CHAR_UUID, self._on_refresh),
-                timeout=10,
-            )
-        except (BleakError, ValueError) as e:
-            log(f"Refresh subscription unavailable: {e}")
-        except asyncio.TimeoutError:
-            log("Refresh subscription timed out; polling without it")
-
-    async def write_payload(self, payload: dict) -> bool:
-        data = json.dumps(payload, separators=(",", ":")).encode()
-        log(f"Sending: {data.decode()}")
-        try:
-            await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
-            return True
-        except BleakError as e:
-            log(f"Write failed: {e}")
-            return False
-
-
-def _is_encryption_error(exc: BaseException) -> bool:
-    """True if a connect error is a macOS bonding/encryption mismatch.
-
-    macOS reports a stale bond as CBErrorDomain Code=15 ("Failed to encrypt
-    the connection..."). Match on the message text so we don't depend on how
-    bleak wraps the underlying CoreBluetooth error.
-    """
-    s = str(exc).lower()
-    return "code=15" in s or "encrypt" in s
-
-
-# blueutil talks to Bluetooth via IOBluetooth, which on recent macOS needs its
-# OWN Bluetooth TCC grant (separate from the daemon's CoreBluetooth grant).
-# Without it, blueutil *hangs* instead of erroring — so every call is bounded
-# by a timeout and a hang is reported as a permission problem, not a crash.
-BLUEUTIL_TIMEOUT = 8
-
-
-def _blueutil(*args: str) -> str | None:
-    """Run `blueutil <args>`, returning stdout, or None on failure/timeout.
-
-    A timeout almost always means blueutil lacks Bluetooth permission (it
-    blocks rather than failing), so we surface that cause explicitly.
-    """
+def read_esp32_ip() -> str:
+    """Read custom ESP32 IP address if specified in config, otherwise default to mDNS clawdmeter.local"""
     try:
-        return subprocess.run(
-            ["blueutil", *args],
-            capture_output=True, text=True,
-            timeout=BLUEUTIL_TIMEOUT, check=True,
-        ).stdout
-    except subprocess.TimeoutExpired:
-        log(f"blueutil {' '.join(args)} timed out — it likely lacks Bluetooth "
-            "permission. Grant it under System Settings > Privacy & Security > "
-            "Bluetooth (run `blueutil --paired` once from Terminal to prompt).")
-        return None
-    except (subprocess.SubprocessError, OSError) as e:
-        log(f"blueutil {' '.join(args)} failed: {e}")
-        return None
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                if key.strip().lower() == "esp32_ip":
+                    return val.strip()
+    except OSError:
+        pass
+    return "clawdmeter.local"
 
 
-def unpair_macos() -> bool:
-    """Forget a stale macOS bond for DEVICE_NAME so the device can re-pair.
-
-    A Code=15 "failed to encrypt" connect error means macOS holds bonding
-    keys that no longer match the ESP32's (e.g. after a firmware reflash or
-    the on-device bond-clear gesture). The firmware pairs "just works" (no
-    MITM), so once the stale bond is gone the next connect re-bonds silently
-    with no GUI prompt.
-
-    CoreBluetooth exposes no unpair API, so we shell out to `blueutil`. The
-    daemon only knows the peripheral's CoreBluetooth UUID, not the BD_ADDR
-    that blueutil needs, so we map by name via `blueutil --paired`. Returns
-    True if a bond was removed. Mirrors the Linux daemon's `bluetoothctl
-    remove` self-heal.
-    """
-    if not shutil.which("blueutil"):
-        log("Stale bond detected but `blueutil` is not installed; cannot "
-            "auto-recover. Run `brew install blueutil`, or forget "
-            f"'{DEVICE_NAME}' in System Settings > Bluetooth and reconnect.")
-        return False
-
-    out = _blueutil("--paired")
-    if out is None:
-        return False
-
-    # Each line looks like:
-    #   address: 28-84-85-55-5c-3d, ... name: "Clawdmeter", ...
-    addr = None
-    for line in out.splitlines():
-        if f'name: "{DEVICE_NAME}"' in line:
-            m = re.search(r"address:\s*([0-9a-fA-F:-]+)", line)
-            if m:
-                addr = m.group(1)
-                break
-    if not addr:
-        log(f"No paired '{DEVICE_NAME}' found to unpair (already forgotten?)")
-        return False
-
-    if _blueutil("--unpair", addr) is None:
-        return False
-    log(f"Unpaired stale bond for '{DEVICE_NAME}' [{addr}]; re-pairing on "
-        "next connect")
-    return True
-
-
-async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
-    """Connect to a target and poll until disconnected or stopped.
-
-    ``target`` is either an address string (Linux) or a BLEDevice carrying
-    live CoreBluetooth details (macOS). Returns True if the connection was
-    used successfully (so the caller keeps the cached address), False if the
-    connection failed and the cache should be invalidated.
-    """
-    display = target if isinstance(target, str) else target.address
-    log(f"Connecting to {display}...")
-    client = BleakClient(target)
+def get_local_ip() -> str:
+    """Get the primary local network IP address of this computer"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # Bound the connect the same way #84 bounded the refresh subscribe.
-        # On macOS the OS auto-connects the firmware's HID link, so
-        # CoreBluetooth can hand us a half-open peripheral whose GATT connect
-        # handshake never completes. BleakClient's own timeout governs
-        # discovery, not connectPeripheral, so an unbounded await here wedges
-        # the single-threaded daemon forever at "Connecting..." (observed ~13h,
-        # device stuck on stale data). wait_for raises TimeoutError, which the
-        # handler below already treats as a connection failure -> drop the
-        # cached address and rescan.
-        await asyncio.wait_for(client.connect(), timeout=CONNECT_TIMEOUT)
-    except (BleakError, asyncio.TimeoutError) as e:
-        log(f"Connection failed: {e}")
-        if sys.platform == "darwin" and _is_encryption_error(e):
-            log("Encryption failed — likely a stale macOS bond; self-healing")
-            unpair_macos()
-        return False
-
-    if not client.is_connected:
-        log("Connection failed (no error but not connected)")
-        return False
-
-    log("Connected")
-    session = Session(client)
-    await session.setup_refresh_subscription()
-
-    last_poll = 0.0
-    used_successfully = False
-    try:
-        while client.is_connected and not stop_event.is_set():
-            now = time.time()
-            elapsed = now - last_poll
-            if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
-                session.refresh_requested.clear()
-                token = read_token()
-                if not token:
-                    log("No token; skipping poll")
-                else:
-                    payload = await poll_api(token)
-                    if payload is not None:
-                        if await session.write_payload(payload):
-                            last_poll = time.time()
-                            used_successfully = True
-
-            try:
-                await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)
-            except asyncio.TimeoutError:
-                pass
+        s.connect(('10.255.255.255', 1))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = '127.0.0.1'
     finally:
-        try:
-            await client.disconnect()
-        except BleakError:
-            pass
+        s.close()
+    return ip
 
-    log("Device disconnected" if not stop_event.is_set() else "Stopping")
-    return used_successfully
+
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Handle incoming approval responses from the ESP32 touch buttons"""
+    try:
+        data = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+    except Exception:
+        writer.close()
+        await writer.wait_closed()
+        return
+
+    req = data.decode('utf-8', errors='ignore')
+    if "POST /api/response" in req:
+        parts = req.split("\r\n\r\n", 1)
+        if len(parts) > 1:
+            try:
+                body = json.loads(parts[1])
+                approved = body.get("approved", False)
+                log(f"Received Wi-Fi approval response from ESP32: {approved}")
+                response_path = Path(os.path.expanduser('~/.claude/approval_response.json'))
+                response_path.write_text(json.dumps({"approved": approved}), encoding="utf-8")
+            except Exception as e:
+                log(f"Failed to parse Wi-Fi approval response JSON: {e}")
+        
+        resp = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Connection: close\r\n\r\n"
+            '{"status":"ok"}'
+        )
+        writer.write(resp.encode())
+        await writer.drain()
+    else:
+        resp = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"
+        writer.write(resp.encode())
+        await writer.drain()
+        
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
 
 
 async def main() -> None:
@@ -667,45 +721,115 @@ async def main() -> None:
         except NotImplementedError:
             signal.signal(sig, _stop)
 
-    log("=== Claude Usage Tracker Daemon (BLE, macOS) ===")
+    log("=== Claude Usage Tracker Daemon (Wi-Fi, macOS/Linux) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
 
-    backoff = 1
-    skip_addr: str | None = None  # macOS: a peripheral to skip for one cycle
-    while not stop_event.is_set():
-        # Apply any pending skip exactly once, then clear it so the next
-        # cycle re-tries retrieveConnected (the device may have recovered).
-        target = await discover_target(skip_addr=skip_addr)
-        skip_addr = None
-        if not target:
-            log(f"Device not found, retrying in {backoff}s...")
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=backoff)
-            except asyncio.TimeoutError:
-                pass
-            backoff = min(backoff * 2, 60)
-            continue
+    server = await asyncio.start_server(handle_client, host='0.0.0.0', port=18989)
+    log("Started local HTTP server on port 18989 for remote approvals")
 
-        addr = target if isinstance(target, str) else target.address
-        ok = await connect_and_run(target, stop_event)
-        if not ok:
-            if sys.platform == "darwin":
-                # No string cache to drop; instead skip this stale handle on
-                # the next retrieveConnected so the scan fallback is reachable.
-                skip_addr = addr
-            else:
-                log("Invalidating cached address")
-                SAVED_ADDR_FILE.unlink(missing_ok=True)
+    last_poll = 0.0
+    
+    claude_payload_cache = None
+    gemini_payload_cache = None
+    
+    last_sent_agent_state = -1
+    last_sent_agent_msg = ""
+    
+    backoff = 1
+    
+    try:
+        while not stop_event.is_set():
+            agent_state = 0
+            agent_msg = ""
+            request_path = Path(os.path.expanduser('~/.claude/approval_request.json'))
+            if request_path.exists():
+                try:
+                    req_data = json.loads(request_path.read_text(encoding="utf-8"))
+                    req_state = req_data.get("state")
+                    if req_state == "needs_approval":
+                        agent_state = 2
+                        agent_msg = req_data.get("message", "Permission request")
+                    elif req_state == "working":
+                        agent_state = 1
+                        agent_msg = req_data.get("message", "Working...")
+                except Exception:
+                    pass
+
+            state_changed = (agent_state != last_sent_agent_state) or (agent_msg != last_sent_agent_msg)
+            
+            now = time.time()
+            elapsed = now - last_poll
+            
+            if elapsed >= POLL_INTERVAL or last_poll == 0.0 or not claude_payload_cache:
+                token = read_token()
+                claude_payload = None
+                if not token:
+                    log("No Claude token; skipping Claude poll")
+                else:
+                    try:
+                        claude_payload = await poll_api(token)
+                    except Exception as e:
+                        log(f"Claude poll exception: {e}")
+                        claude_payload = None
+                
+                gemini_key = read_gemini_api_key()
+                gemini_pid = read_gemini_project_id()
+                gemini_payload = None
+                if gemini_key and gemini_pid:
+                    try:
+                        gemini_payload = await poll_gemini_usage(gemini_key, gemini_pid)
+                    except Exception as e:
+                        log(f"Gemini poll exception: {e}")
+                        gemini_payload = None
+                else:
+                    log("Gemini API key or project ID not configured; skipping Gemini poll")
+                    
+                claude_payload_cache = claude_payload
+                gemini_payload_cache = gemini_payload
+                last_poll = time.time()
+
+            payload = build_ble_payload(claude_payload_cache, gemini_payload_cache, agent_state, agent_msg)
+            payload["d_url"] = f"http://{get_local_ip()}:18989/api/response"
+
+            target_host = read_esp32_ip()
+            esp_url = f"http://{target_host}/api/payload"
+
+            if state_changed or elapsed >= POLL_INTERVAL or last_sent_agent_state == -1:
+                if payload.get("ok"):
+                    log(f"Sending payload to ESP32: {payload} -> {esp_url}")
+                    try:
+                        async with httpx.AsyncClient(timeout=4.0) as http:
+                            resp = await http.post(esp_url, json=payload)
+                        if resp.status_code == 200:
+                            last_sent_agent_state = agent_state
+                            last_sent_agent_msg = agent_msg
+                            backoff = 1
+                        else:
+                            log(f"ESP32 returned HTTP {resp.status_code}")
+                            raise Exception("Bad HTTP status")
+                    except Exception as e:
+                        log(f"Failed to send payload to ESP32: {e}")
+                        try:
+                            await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                        except asyncio.TimeoutError:
+                            pass
+                        backoff = min(backoff * 2, 60)
+                        continue
+                else:
+                    log("Both Claude and Gemini polls failed; skipping write")
+
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                await asyncio.wait_for(stop_event.wait(), timeout=TICK)
             except asyncio.TimeoutError:
                 pass
-            backoff = min(backoff * 2, 60)
-        else:
-            backoff = 1
+    finally:
+        server.close()
+        await server.wait_closed()
+        log("HTTP server closed")
 
 
 if __name__ == "__main__":
+    import socket
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

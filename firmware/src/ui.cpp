@@ -127,6 +127,31 @@ static lv_obj_t* lbl_spending_desc = nullptr;     // "of your monthly budget"
 static lv_obj_t* lbl_spending_status = nullptr;   // "Under pace" / "On pace" / "Over pace"
 static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
 
+#define THEME_GEMINI_ACCENT lv_color_hex(0x9b72ff)
+static int active_model = 0; // 0 = Claude, 1 = Gemini
+static UsageData cached_data = {};
+static bool has_cached_data = false;
+
+static lv_obj_t* approval_overlay = nullptr;
+static lv_obj_t* lbl_approval_title = nullptr;
+static lv_obj_t* lbl_approval_msg = nullptr;
+static lv_obj_t* btn_approve = nullptr;
+static lv_obj_t* btn_deny = nullptr;
+
+static lv_obj_t* wifi_modal = nullptr;
+static lv_obj_t* lbl_wifi_modal_title = nullptr;
+static lv_obj_t* lbl_wifi_modal_msg = nullptr;
+static lv_obj_t* btn_wifi_modal_ok = nullptr;
+static lv_obj_t* btn_wifi_modal_cancel = nullptr;
+static bool wifi_modal_is_home_prompt = true;
+
+static lv_obj_t* settings_modal = nullptr;
+static lv_obj_t* lbl_settings_title = nullptr;
+static lv_obj_t* lbl_settings_info = nullptr;
+static lv_obj_t* btn_settings_home = nullptr;
+static lv_obj_t* btn_settings_phone = nullptr;
+static lv_obj_t* btn_settings_close = nullptr;
+
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
 static lv_obj_t* logo_img;
@@ -222,6 +247,12 @@ static void format_reset_time(int mins, char* buf, size_t len) {
 
 // Forward decls — callbacks defined near ui_show_screen below
 static void global_click_cb(lv_event_t* e);
+static void panel_click_cb(lv_event_t* e);
+static void logo_click_cb(lv_event_t* e);
+static void settings_home_click_cb(lv_event_t* e);
+static void settings_phone_click_cb(lv_event_t* e);
+static void settings_close_click_cb(lv_event_t* e);
+static void build_settings_modal(lv_obj_t* parent);
 
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
@@ -327,19 +358,19 @@ static void build_pair_group(lv_obj_t* parent) {
     lv_obj_add_flag(pair_group, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     lv_obj_t* l1 = lv_label_create(pair_group);
-    lv_label_set_text(l1, "To pair");
+    lv_label_set_text(l1, "Wi-Fi Connecting");
     lv_obj_set_style_text_font(l1, L.bt_status_font, 0);
     lv_obj_set_style_text_color(l1, COL_TEXT, 0);
     lv_obj_align(l1, LV_ALIGN_TOP_MID, 0, 40);
 
     lv_obj_t* l2 = lv_label_create(pair_group);
-    lv_label_set_text(l2, "hold the power button");
+    lv_label_set_text(l2, "Connecting to network...");
     lv_obj_set_style_text_font(l2, L.bt_device_font, 0);
     lv_obj_set_style_text_color(l2, COL_DIM, 0);
     lv_obj_align(l2, LV_ALIGN_TOP_MID, 0, 120);
 
     lv_obj_t* l3 = lv_label_create(pair_group);
-    lv_label_set_text(l3, "for 3 seconds, then release");
+    lv_label_set_text(l3, "Check wifi_credentials.h");
     lv_obj_set_style_text_font(l3, L.bt_device_font, 0);
     lv_obj_set_style_text_color(l3, COL_DIM, 0);
     lv_obj_align(l3, LV_ALIGN_TOP_MID, 0, 160);
@@ -367,6 +398,265 @@ static void build_idle_group(lv_obj_t* parent) {
     if (creature) lv_obj_align(creature, LV_ALIGN_CENTER, 0, -20);
 
     lv_obj_add_flag(idle_group, LV_OBJ_FLAG_HIDDEN);  // update_view_state decides
+}
+
+#include "net_server.h"
+
+static void approve_click_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        net_send_response("{\"approved\":true}");
+        if (approval_overlay) lv_obj_add_flag(approval_overlay, LV_OBJ_FLAG_HIDDEN);
+        cached_data.agent_state = 0;
+        ui_update(nullptr);
+    }
+}
+
+static void deny_click_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        net_send_response("{\"approved\":false}");
+        if (approval_overlay) lv_obj_add_flag(approval_overlay, LV_OBJ_FLAG_HIDDEN);
+        cached_data.agent_state = 0;
+        ui_update(nullptr);
+    }
+}
+
+static void wifi_modal_ok_click_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        if (wifi_modal_is_home_prompt) {
+            net_connect_home();
+        } else {
+            net_connect_phone();
+        }
+        if (wifi_modal) lv_obj_add_flag(wifi_modal, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void wifi_modal_cancel_click_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        if (wifi_modal_is_home_prompt) {
+            net_clear_home_detected(); // ignore home detected
+        }
+        if (wifi_modal) lv_obj_add_flag(wifi_modal, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void logo_click_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        lv_event_stop_processing(e);
+        if (settings_modal) {
+            char info_buf[128];
+            const char* net_name = net_is_using_home() ? "Home Wi-Fi" : "Phone Hotspot";
+            const char* status_str = "Disconnected";
+            net_state_t ns = net_get_state();
+            if (ns == NET_STATE_CONNECTED) status_str = "Connected";
+            else if (ns == NET_STATE_CONNECTING) status_str = "Connecting";
+            
+            snprintf(info_buf, sizeof(info_buf), 
+                "Active Net: %s\nStatus: %s\nIP: %s", 
+                net_name, status_str, net_get_ip_address());
+            lv_label_set_text(lbl_settings_info, info_buf);
+            
+            lv_obj_remove_flag(settings_modal, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+static void settings_home_click_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        net_connect_home();
+        if (settings_modal) lv_obj_add_flag(settings_modal, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void settings_phone_click_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        net_connect_phone();
+        if (settings_modal) lv_obj_add_flag(settings_modal, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void settings_close_click_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        if (settings_modal) lv_obj_add_flag(settings_modal, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void build_settings_modal(lv_obj_t* parent) {
+    settings_modal = lv_obj_create(parent);
+    lv_obj_set_size(settings_modal, L.scr_w - 40, L.scr_h - 100);
+    lv_obj_align(settings_modal, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(settings_modal, lv_color_hex(0x1a1a24), 0); // dark grey-blue
+    lv_obj_set_style_bg_opa(settings_modal, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(settings_modal, 2, 0);
+    lv_obj_set_style_border_color(settings_modal, COL_ACCENT, 0);
+    lv_obj_set_style_pad_all(settings_modal, 15, 0);
+    lv_obj_clear_flag(settings_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lbl_settings_title = lv_label_create(settings_modal);
+    lv_label_set_text(lbl_settings_title, "Settings");
+    lv_obj_set_style_text_font(lbl_settings_title, &font_styrene_24, 0);
+    lv_obj_set_style_text_color(lbl_settings_title, COL_TEXT, 0);
+    lv_obj_align(lbl_settings_title, LV_ALIGN_TOP_MID, 0, 5);
+
+    lbl_settings_info = lv_label_create(settings_modal);
+    lv_label_set_text(lbl_settings_info, "");
+    lv_label_set_long_mode(lbl_settings_info, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl_settings_info, L.scr_w - 80);
+    lv_obj_set_style_text_font(lbl_settings_info, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_settings_info, COL_DIM, 0);
+    lv_obj_set_style_text_align(lbl_settings_info, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lbl_settings_info, LV_ALIGN_TOP_MID, 0, 45);
+
+    // Switch to Home button
+    btn_settings_home = lv_button_create(settings_modal);
+    lv_obj_set_size(btn_settings_home, L.scr_w - 80, 45);
+    lv_obj_align(btn_settings_home, LV_ALIGN_TOP_MID, 0, 120);
+    lv_obj_set_style_bg_color(btn_settings_home, lv_color_hex(0x282c34), 0);
+    lv_obj_add_event_cb(btn_settings_home, settings_home_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* lbl_h = lv_label_create(btn_settings_home);
+    lv_label_set_text(lbl_h, "Switch to Home Wi-Fi");
+    lv_obj_set_style_text_font(lbl_h, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_h, COL_TEXT, 0);
+    lv_obj_align(lbl_h, LV_ALIGN_CENTER, 0, 0);
+
+    // Switch to Phone button
+    btn_settings_phone = lv_button_create(settings_modal);
+    lv_obj_set_size(btn_settings_phone, L.scr_w - 80, 45);
+    lv_obj_align(btn_settings_phone, LV_ALIGN_TOP_MID, 0, 175);
+    lv_obj_set_style_bg_color(btn_settings_phone, lv_color_hex(0x282c34), 0);
+    lv_obj_add_event_cb(btn_settings_phone, settings_phone_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* lbl_p = lv_label_create(btn_settings_phone);
+    lv_label_set_text(lbl_p, "Switch to Phone Hotspot");
+    lv_obj_set_style_text_font(lbl_p, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_p, COL_TEXT, 0);
+    lv_obj_align(lbl_p, LV_ALIGN_CENTER, 0, 0);
+
+    // Close button
+    btn_settings_close = lv_button_create(settings_modal);
+    lv_obj_set_size(btn_settings_close, L.scr_w - 80, 45);
+    lv_obj_align(btn_settings_close, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_obj_set_style_bg_color(btn_settings_close, COL_RED, 0);
+    lv_obj_add_event_cb(btn_settings_close, settings_close_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* lbl_c = lv_label_create(btn_settings_close);
+    lv_label_set_text(lbl_c, "Close");
+    lv_obj_set_style_text_font(lbl_c, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_c, COL_TEXT, 0);
+    lv_obj_align(lbl_c, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_add_flag(settings_modal, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void build_wifi_modal(lv_obj_t* parent) {
+    wifi_modal = lv_obj_create(parent);
+    lv_obj_set_size(wifi_modal, L.scr_w - 40, L.scr_h / 2);
+    lv_obj_align(wifi_modal, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(wifi_modal, lv_color_hex(0x1a1a24), 0); // dark grey-blue
+    lv_obj_set_style_bg_opa(wifi_modal, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(wifi_modal, 2, 0);
+    lv_obj_set_style_border_color(wifi_modal, COL_ACCENT, 0);
+    lv_obj_set_style_pad_all(wifi_modal, 15, 0);
+    lv_obj_clear_flag(wifi_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lbl_wifi_modal_title = lv_label_create(wifi_modal);
+    lv_label_set_text(lbl_wifi_modal_title, "Wi-Fi Alert");
+    lv_obj_set_style_text_font(lbl_wifi_modal_title, &font_styrene_20, 0);
+    lv_obj_set_style_text_color(lbl_wifi_modal_title, COL_TEXT, 0);
+    lv_obj_align(lbl_wifi_modal_title, LV_ALIGN_TOP_MID, 0, 10);
+
+    lbl_wifi_modal_msg = lv_label_create(wifi_modal);
+    lv_label_set_text(lbl_wifi_modal_msg, "");
+    lv_label_set_long_mode(lbl_wifi_modal_msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl_wifi_modal_msg, L.scr_w - 80);
+    lv_obj_set_style_text_font(lbl_wifi_modal_msg, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_wifi_modal_msg, COL_DIM, 0);
+    lv_obj_set_style_text_align(lbl_wifi_modal_msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lbl_wifi_modal_msg, LV_ALIGN_CENTER, 0, -10);
+
+    btn_wifi_modal_ok = lv_button_create(wifi_modal);
+    lv_obj_set_size(btn_wifi_modal_ok, L.scr_w / 2 - 40, 45);
+    lv_obj_align(btn_wifi_modal_ok, LV_ALIGN_BOTTOM_LEFT, 5, -10);
+    lv_obj_set_style_bg_color(btn_wifi_modal_ok, COL_GREEN, 0);
+    lv_obj_add_event_cb(btn_wifi_modal_ok, wifi_modal_ok_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* lbl_ok = lv_label_create(btn_wifi_modal_ok);
+    lv_label_set_text(lbl_ok, "Connect");
+    lv_obj_set_style_text_font(lbl_ok, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_ok, COL_TEXT, 0);
+    lv_obj_align(lbl_ok, LV_ALIGN_CENTER, 0, 0);
+
+    btn_wifi_modal_cancel = lv_button_create(wifi_modal);
+    lv_obj_set_size(btn_wifi_modal_cancel, L.scr_w / 2 - 40, 45);
+    lv_obj_align(btn_wifi_modal_cancel, LV_ALIGN_BOTTOM_RIGHT, -5, -10);
+    lv_obj_set_style_bg_color(btn_wifi_modal_cancel, COL_RED, 0);
+    lv_obj_add_event_cb(btn_wifi_modal_cancel, wifi_modal_cancel_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* lbl_cancel = lv_label_create(btn_wifi_modal_cancel);
+    lv_label_set_text(lbl_cancel, "Cancel");
+    lv_obj_set_style_text_font(lbl_cancel, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_cancel, COL_TEXT, 0);
+    lv_obj_align(lbl_cancel, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_add_flag(wifi_modal, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void build_approval_overlay(lv_obj_t* parent) {
+    approval_overlay = lv_obj_create(parent);
+    lv_obj_set_size(approval_overlay, L.scr_w, L.scr_h);
+    lv_obj_set_pos(approval_overlay, 0, 0);
+    lv_obj_set_style_bg_color(approval_overlay, lv_color_hex(0x1f0f0f), 0); // very dark red
+    lv_obj_set_style_bg_opa(approval_overlay, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(approval_overlay, 0, 0);
+    lv_obj_set_style_pad_all(approval_overlay, 20, 0);
+    lv_obj_clear_flag(approval_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lbl_approval_title = lv_label_create(approval_overlay);
+    lv_label_set_text(lbl_approval_title, "Permission Request");
+    lv_obj_set_style_text_font(lbl_approval_title, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(lbl_approval_title, COL_TEXT, 0);
+    lv_obj_align(lbl_approval_title, LV_ALIGN_TOP_MID, 0, 40);
+
+    lbl_approval_msg = lv_label_create(approval_overlay);
+    lv_label_set_text(lbl_approval_msg, "");
+    lv_label_set_long_mode(lbl_approval_msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl_approval_msg, L.scr_w - 60);
+    lv_obj_set_style_text_font(lbl_approval_msg, &font_styrene_20, 0);
+    lv_obj_set_style_text_color(lbl_approval_msg, COL_DIM, 0);
+    lv_obj_set_style_text_align(lbl_approval_msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lbl_approval_msg, LV_ALIGN_CENTER, 0, -20);
+
+    btn_approve = lv_button_create(approval_overlay);
+    lv_obj_set_size(btn_approve, L.scr_w / 2 - 30, 60);
+    lv_obj_align(btn_approve, LV_ALIGN_BOTTOM_LEFT, 10, -50);
+    lv_obj_set_style_bg_color(btn_approve, COL_GREEN, 0);
+    lv_obj_add_event_cb(btn_approve, approve_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* lbl_btn_app = lv_label_create(btn_approve);
+    lv_label_set_text(lbl_btn_app, "Approve");
+    lv_obj_set_style_text_font(lbl_btn_app, &font_styrene_20, 0);
+    lv_obj_set_style_text_color(lbl_btn_app, COL_TEXT, 0);
+    lv_obj_align(lbl_btn_app, LV_ALIGN_CENTER, 0, 0);
+
+    btn_deny = lv_button_create(approval_overlay);
+    lv_obj_set_size(btn_deny, L.scr_w / 2 - 30, 60);
+    lv_obj_align(btn_deny, LV_ALIGN_BOTTOM_RIGHT, -10, -50);
+    lv_obj_set_style_bg_color(btn_deny, COL_RED, 0);
+    lv_obj_add_event_cb(btn_deny, deny_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* lbl_btn_deny = lv_label_create(btn_deny);
+    lv_label_set_text(lbl_btn_deny, "Deny");
+    lv_obj_set_style_text_font(lbl_btn_deny, &font_styrene_20, 0);
+    lv_obj_set_style_text_color(lbl_btn_deny, COL_TEXT, 0);
+    lv_obj_align(lbl_btn_deny, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_add_flag(approval_overlay, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void init_usage_screen(lv_obj_t* scr) {
@@ -436,6 +726,16 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_set_style_text_font(lbl_anim, &font_mono_32, 0);
     lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, -15);
+
+    lv_obj_clear_flag(panel_session, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_event_cb(panel_session, panel_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_event_cb(panel_weekly, panel_click_cb, LV_EVENT_CLICKED, NULL);
+
+    build_approval_overlay(usage_container);
+    build_wifi_modal(usage_container);
+    build_settings_modal(usage_container);
 }
 
 // ======== Public API ========
@@ -460,6 +760,8 @@ void ui_init(void) {
     logo_img = lv_image_create(scr);
     lv_image_set_src(logo_img, &logo_dsc);
     lv_obj_set_pos(logo_img, L.margin, L.title_y - 10);
+    lv_obj_add_flag(logo_img, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(logo_img, logo_click_cb, LV_EVENT_CLICKED, NULL);
 
     battery_img = lv_image_create(scr);
     lv_image_set_src(battery_img, &battery_dscs[0]);
@@ -468,23 +770,69 @@ void ui_init(void) {
 }
 
 void ui_update(const UsageData* data) {
-    if (!data->valid) return;
+    if (data != nullptr) {
+        cached_data = *data;
+        has_cached_data = true;
+    }
+    if (!has_cached_data) return;
+
+    const UsageData* cur_data = &cached_data;
     last_data_ms = lv_tick_get();   // a valid usage update just landed → dot goes green
     data_received = true;
 
-    if (data->clock_epoch > 0) {    // daemon supplied wall-clock time → drive the title clock
-        clock_base_epoch = data->clock_epoch;
+    static int prev_agent_state = 0;
+    if (cur_data->agent_state == 2 && prev_agent_state != 2) {
+        #include "hal/sound_hal.h"
+        sound_hal_play_reset();
+    }
+    prev_agent_state = cur_data->agent_state;
+
+    if (approval_overlay) {
+        if (cur_data->agent_state == 2) {
+            lv_label_set_text(lbl_approval_msg, cur_data->agent_msg);
+            lv_obj_remove_flag(approval_overlay, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(approval_overlay, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    if (cur_data->clock_epoch > 0) {    // daemon supplied wall-clock time → drive the title clock
+        clock_base_epoch = cur_data->clock_epoch;
         clock_base_ms = last_data_ms;
-        clock_fmt = data->clock_fmt;
+        clock_fmt = cur_data->clock_fmt;
     } else if (clock_base_epoch != 0) {   // clock turned off daemon-side → revert title to "Usage"
         clock_base_epoch = 0;
         clock_last_min = -1;
-        lv_label_set_text(lbl_title, "Usage");
+        lv_label_set_text(lbl_title, active_model == 0 ? "Claude" : "Gemini");
     }
 
-    int s_pct = (int)(data->session_pct + 0.5f);
+    if (clock_base_epoch == 0) {
+        lv_label_set_text(lbl_title, active_model == 0 ? "Claude" : "Gemini");
+    }
 
-    if (data->enterprise) {
+    float session_pct = 0.0f;
+    int session_reset_mins = -1;
+    float weekly_pct = 0.0f;
+    int weekly_reset_mins = -1;
+
+    if (active_model == 0) {
+        // Claude
+        session_pct = cur_data->claude.session_pct;
+        session_reset_mins = cur_data->claude.session_reset_mins;
+        weekly_pct = cur_data->claude.weekly_pct;
+        weekly_reset_mins = cur_data->claude.weekly_reset_mins;
+    } else {
+        // Gemini
+        session_pct = cur_data->gemini.session_pct;
+        session_reset_mins = cur_data->gemini.session_reset_mins;
+        weekly_pct = cur_data->gemini.weekly_pct;
+        weekly_reset_mins = cur_data->gemini.weekly_reset_mins;
+    }
+
+    int s_pct = (int)(session_pct + 0.5f);
+    bool is_enterprise = (active_model == 0 && cur_data->enterprise);
+
+    if (is_enterprise) {
         // Spending box: big number-only label + small "%" symbol + desc + pace
         lv_obj_set_style_text_font(lbl_session_pct, &font_tiempos_56, 0);
         lv_label_set_text(lbl_session_label, "Spending");
@@ -495,7 +843,7 @@ void ui_update(const UsageData* data) {
         if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_set_style_text_font(lbl_session_pct, &font_styrene_48, 0);
-        lv_label_set_text(lbl_session_label, "Current");
+        lv_label_set_text(lbl_session_label, active_model == 0 ? "Claude" : "Gemini");
         lv_obj_clear_flag(lbl_session_reset, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_spending_desc,   LV_OBJ_FLAG_HIDDEN);
@@ -509,45 +857,49 @@ void ui_update(const UsageData* data) {
     const char* pace_text = "Under pace";
     lv_color_t  pace_color = COL_GREEN;
     const char* pace_hex   = "788c5d";   // matches THEME_GREEN
-    if (data->session_pct > (float)data->time_pct + 15.0f) {
+    if (session_pct > (float)cur_data->time_pct + 15.0f) {
         pace_text = "Over pace";  pace_color = COL_RED;   pace_hex = "c0392b";
-    } else if (data->session_pct > (float)data->time_pct - 15.0f) {
+    } else if (session_pct > (float)cur_data->time_pct - 15.0f) {
         pace_text = "On pace";    pace_color = COL_AMBER; pace_hex = "d97757";
     }
 
-    if (data->enterprise) {
+    if (is_enterprise) {
         lv_label_set_text_fmt(lbl_session_pct, "%d", s_pct);
         lv_obj_align_to(lbl_session_pct_sym, lbl_session_pct,
                         LV_ALIGN_OUT_RIGHT_TOP, 4, 12);
     } else {
         lv_label_set_text_fmt(lbl_session_pct, "%d%%", s_pct);
-        format_reset_time(data->session_reset_mins, buf, sizeof(buf));
+        format_reset_time(session_reset_mins, buf, sizeof(buf));
         lv_label_set_text(lbl_session_reset, buf);
     }
 
     lv_bar_set_value(bar_session, s_pct, LV_ANIM_ON);
-    lv_obj_set_style_bg_color(bar_session, pct_color(data->session_pct), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(bar_session, pct_color(session_pct), LV_PART_INDICATOR);
 
-    if (data->enterprise) {
+    if (is_enterprise) {
         // Period box: time % + dynamic pace color + "Resets <date>" label
         lv_label_set_text(lbl_weekly_label, "Period");
-        lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", data->time_pct);
-        lv_bar_set_value(bar_weekly, data->time_pct, LV_ANIM_ON);
-        lv_color_t bar_pace = (data->session_pct <= (float)data->time_pct) ? COL_GREEN :
-                              (data->session_pct <= (float)data->time_pct + 15.0f) ? COL_AMBER :
+        lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", cur_data->time_pct);
+        lv_bar_set_value(bar_weekly, cur_data->time_pct, LV_ANIM_ON);
+        lv_color_t bar_pace = (session_pct <= (float)cur_data->time_pct) ? COL_GREEN :
+                              (session_pct <= (float)cur_data->time_pct + 15.0f) ? COL_AMBER :
                               COL_RED;
         lv_obj_set_style_bg_color(bar_weekly, bar_pace, LV_PART_INDICATOR);
         snprintf(buf, sizeof(buf), "#%s %s# - #faf9f5 Resets %s#",
-                 pace_hex, pace_text, data->reset_date);
+                 pace_hex, pace_text, cur_data->reset_date);
         lv_label_set_text(lbl_weekly_reset, buf);
     } else {
-        int w_pct = (int)(data->weekly_pct + 0.5f);
+        int w_pct = (int)(weekly_pct + 0.5f);
+        lv_label_set_text(lbl_weekly_label, active_model == 0 ? "Weekly" : "Daily");
         lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", w_pct);
         lv_bar_set_value(bar_weekly, w_pct, LV_ANIM_ON);
-        lv_obj_set_style_bg_color(bar_weekly, pct_color(data->weekly_pct), LV_PART_INDICATOR);
-        format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
+        lv_obj_set_style_bg_color(bar_weekly, pct_color(weekly_pct), LV_PART_INDICATOR);
+        format_reset_time(weekly_reset_mins, buf, sizeof(buf));
         lv_label_set_text(lbl_weekly_reset, buf);
     }
+
+    // Set animation spinner color to match active model
+    lv_obj_set_style_text_color(lbl_anim, active_model == 0 ? COL_ACCENT : THEME_GEMINI_ACCENT, 0);
 }
 
 // Pick the usage-view sub-screen: pairing hint (BLE down), the idle "Zzz" screen
@@ -614,10 +966,18 @@ void ui_tick_anim(void) {
 
     // Status text by priority. Whimsical messages only when connected & settled.
     const char* text;
+    lv_color_t spinner_color = active_model == 0 ? COL_ACCENT : THEME_GEMINI_ACCENT;
+
     if (!s_ble_connected) {
         text = "Waiting";              // advertising / waiting for a host connection
     } else if (view_state == 1) {      // idle — alternate so it reads as alive AND data-less
         text = (anim_msg_idx & 1) ? "No data" : "Listening";
+    } else if (has_cached_data && cached_data.agent_state == 1) {
+        text = "Working";
+        spinner_color = COL_RED;
+    } else if (has_cached_data && cached_data.agent_state == 2) {
+        text = "Needs permit";
+        spinner_color = COL_AMBER;
     } else if (now - connected_at_ms < 5000) {
         text = "Connected";
     } else {
@@ -629,6 +989,27 @@ void ui_tick_anim(void) {
     snprintf(buf, sizeof(buf), "%s %s\xE2\x80\xA6",
              spinner_frames[anim_spinner_idx], text);
     lv_label_set_text(lbl_anim, buf);
+    lv_obj_set_style_text_color(lbl_anim, spinner_color, 0);
+
+    // Check Wi-Fi state for modals
+    static net_state_t prev_net_state = NET_STATE_INIT;
+    net_state_t ns = net_get_state();
+    
+    if (wifi_modal && lv_obj_has_flag(wifi_modal, LV_OBJ_FLAG_HIDDEN)) {
+        if (ns == NET_STATE_DISCONNECTED && prev_net_state == NET_STATE_CONNECTED && net_is_using_home()) {
+            wifi_modal_is_home_prompt = false;
+            lv_label_set_text(lbl_wifi_modal_title, "Connection Lost");
+            lv_label_set_text(lbl_wifi_modal_msg, "Home Wi-Fi lost.\nConnect to Phone Hotspot?");
+            lv_obj_remove_flag(wifi_modal, LV_OBJ_FLAG_HIDDEN);
+        }
+        else if (net_is_home_detected() && !net_is_using_home()) {
+            wifi_modal_is_home_prompt = true;
+            lv_label_set_text(lbl_wifi_modal_title, "Home Detected");
+            lv_label_set_text(lbl_wifi_modal_msg, "Home Wi-Fi detected.\nSwitch to Home Wi-Fi?");
+            lv_obj_remove_flag(wifi_modal, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    prev_net_state = ns;
 }
 
 static screen_t prev_non_splash_screen = SCREEN_USAGE;
@@ -637,6 +1018,36 @@ static void apply_battery_visibility(void) {
     if (current_screen == SCREEN_SPLASH) lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
     else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
 }
+
+int ui_get_active_model(void) {
+    return active_model;
+}
+
+#include "usage_rate.h"
+
+void ui_cycle_model(void) {
+    active_model = 1 - active_model;
+    
+    // When switching models, re-sample rate based on the new active model's usage
+    if (has_cached_data) {
+        float active_session_pct = (active_model == 0) ? cached_data.claude.session_pct : cached_data.gemini.session_pct;
+        usage_rate_sample(active_session_pct);
+        if (splash_is_active()) {
+            splash_pick_for_current_rate();
+        }
+    }
+    
+    ui_update(nullptr);
+}
+
+static void panel_click_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        lv_event_stop_processing(e);
+        ui_cycle_model();
+    }
+}
+
 
 static void global_click_cb(lv_event_t* e) {
     (void)e;
@@ -673,10 +1084,10 @@ screen_t ui_get_current_screen(void) {
     return current_screen;
 }
 
-void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) {
-    (void)name; (void)mac;
+void ui_update_net_status(net_state_t state, const char* name, const char* ip) {
+    (void)name; (void)ip;
     bool was_connected = s_ble_connected;
-    s_ble_connected = (state == BLE_STATE_CONNECTED);
+    s_ble_connected = (state == NET_STATE_CONNECTED);
 
     if (s_ble_connected && !was_connected) connected_at_ms = lv_tick_get();
     // pair / idle / usage — picked from connection + data freshness.

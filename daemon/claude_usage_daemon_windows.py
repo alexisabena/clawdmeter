@@ -17,6 +17,7 @@ import re
 import signal
 import subprocess
 import sys
+import socket
 import threading
 import time
 from pathlib import Path
@@ -29,10 +30,11 @@ from bleak.exc import BleakError
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
+TX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000003"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
-TICK = 5
+TICK = 1
 SCAN_TIMEOUT = 8.0
 CONNECT_RETRIES = 3        # D-01: attempts before giving up on a device
 CONNECT_RETRY_DELAY = 2.0  # D-01: seconds between failed connect attempts
@@ -113,6 +115,164 @@ class AuthError(Exception):
     must NOT be mislabeled as a token problem (SC#5: a boot-time `getaddrinfo
     failed` DNS blip wrongly fired the 'token expired' toast)."""
 
+
+async def poll_api(token: str) -> dict | None:
+    headers = dict(API_HEADERS_TEMPLATE)
+    headers["Authorization"] = f"Bearer {token}"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as http:
+            resp = await http.post(API_URL, headers=headers, json=API_BODY)
+    except httpx.HTTPError as e:
+        log(f"API call failed: {e}")
+        return None
+    if resp.status_code in (401, 403):
+        log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
+        raise AuthError(resp.status_code)
+    if resp.status_code >= 400:
+        log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
+        return None
+
+    def hdr(name: str, default: str = "0") -> str:
+        return resp.headers.get(name, default)
+
+    now = time.time()
+
+    def reset_minutes(reset_ts: str) -> int:
+        try:
+            r = float(reset_ts)
+        except ValueError:
+            return 0
+        mins = (r - now) / 60.0
+        return int(round(mins)) if mins > 0 else 0
+
+    def pct(util: str) -> int:
+        try:
+            return int(round(float(util) * 100))
+        except ValueError:
+            return 0
+
+    if resp.headers.get("anthropic-ratelimit-unified-5h-utilization"):
+        payload = {
+            "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
+            "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
+            "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
+            "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
+            "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
+            "acct": "pro",
+            "ok": True,
+        }
+    else:
+        reset_ts = hdr("anthropic-ratelimit-unified-overage-reset")
+        payload = {
+            "s": pct(hdr("anthropic-ratelimit-unified-overage-utilization")),
+            "sr": reset_minutes(reset_ts),
+            "w": 0,
+            "wr": 0,
+            "st": hdr("anthropic-ratelimit-unified-status", "unknown"),
+            "acct": "ent",
+            **_billing_period_info(now, reset_ts),
+            "ok": True,
+        }
+    return payload
+
+
+def _billing_period_info(now: float, reset_ts: str) -> dict:
+    """Fraction of billing period elapsed (tp, 0-100) and period length in days (pd)."""
+    try:
+        period_end = float(reset_ts)
+    except ValueError:
+        return {"tp": 0, "pd": 30, "rd": ""}
+    dt_end = datetime.datetime.fromtimestamp(period_end)
+    prev_month = dt_end.month - 1 or 12
+    prev_year = dt_end.year if dt_end.month > 1 else dt_end.year - 1
+    prev_day = min(dt_end.day, calendar.monthrange(prev_year, prev_month)[1])
+    dt_start = dt_end.replace(year=prev_year, month=prev_month, day=prev_day)
+    period_start = dt_start.timestamp()
+    period_len = period_end - period_start
+    if period_len <= 0:
+        return {"tp": 0, "pd": 30, "rd": ""}
+    pct_val = (now - period_start) / period_len * 100
+    return {
+        "tp": max(0, min(100, int(round(pct_val)))),
+        "pd": int(round(period_len / 86400)),
+        "rd": f"{dt_end.strftime('%b')} {dt_end.day}",
+    }
+
+
+def _extract_access_token(blob: str) -> str | None:
+    """Pull the accessToken out of a credentials blob."""
+    blob = blob.strip()
+    if not blob:
+        return None
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict):
+        tok = data.get("accessToken")
+        if isinstance(tok, str) and tok.strip():
+            return tok
+        for v in data.values():
+            if isinstance(v, dict):
+                tok = v.get("accessToken")
+                if isinstance(tok, str) and tok.strip():
+                    return tok
+    m = re.search(r'"accessToken"\s*:\s*"([^"]+)"', blob)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_\-.~+/=]{20,}", blob):
+        return blob
+    return None
+
+
+def _windows_credential_candidates() -> list[Path]:
+    """Return the ordered list of credential file paths to probe."""
+    if override := os.environ.get("CLAUDE_CREDENTIALS_PATH"):
+        return [Path(override)]
+    if config_dir := os.environ.get("CLAUDE_CONFIG_DIR"):
+        return [Path(config_dir) / ".credentials.json"]
+    home = Path.home()
+    local_appdata = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
+    appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
+    return [
+        home / ".claude" / ".credentials.json",
+        local_appdata / "Claude" / ".credentials.json",
+        appdata / "Claude" / ".credentials.json",
+    ]
+
+
+def read_token() -> str | None:
+    """Read the Claude OAuth access token from the first available credential file."""
+    for path in _windows_credential_candidates():
+        try:
+            return _extract_access_token(path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    return None
+
+
+def _read_expiry() -> str:
+    """Return human-readable expiry from the first-hit credentials file."""
+    for path in _windows_credential_candidates():
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        try:
+            data = json.loads(raw)
+            oauth = data.get("claudeAiOauth", {})
+            expires_ms = oauth.get("expiresAt")
+            if expires_ms is None:
+                return "expiry unknown"
+            dt = datetime.datetime.fromtimestamp(
+                expires_ms / 1000, tz=datetime.timezone.utc
+            )
+            return dt.strftime("%Y-%m-%d %H:%M UTC")
+        except (TypeError, ValueError, OSError, AttributeError, json.JSONDecodeError):
+            continue
+    return "expiry unknown"
+
+
 def read_chime_setting() -> str:
     """Read the `chime` option from the config file. One of: off|on.
 
@@ -184,476 +344,257 @@ def add_clock_fields(payload: dict) -> None:
     payload["tf"] = tf
 
 
-async def poll_api(token: str) -> dict | None:
-    headers = dict(API_HEADERS_TEMPLATE)
-    headers["Authorization"] = f"Bearer {token}"
+def read_gemini_api_key() -> str | None:
+    if key := os.environ.get("GEMINI_API_KEY"):
+        return key.strip()
     try:
-        async with httpx.AsyncClient(timeout=20.0) as http:
-            resp = await http.post(API_URL, headers=headers, json=API_BODY)
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip().lower() == "gemini_api_key":
+                    return v.strip()
+    except OSError:
+        pass
+    return None
+
+
+def read_gemini_project_id() -> str | None:
+    if pid := os.environ.get("GEMINI_PROJECT_ID"):
+        return pid.strip()
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip().lower() == "gemini_project_id":
+                    return v.strip()
+    except OSError:
+        pass
+    return None
+
+
+async def poll_gemini_usage(api_key: str, project_id: str) -> dict | None:
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    start_dt = now_dt - datetime.timedelta(minutes=15)
+    
+    start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    
+    url = f"https://monitoring.googleapis.com/v3/projects/{project_id}/timeSeries"
+    
+    params_use = {
+        "filter": 'metric.type = "serviceruntime.googleapis.com/quota/rate/use"',
+        "interval.startTime": start_str,
+        "interval.endTime": end_str,
+        "key": api_key
+    }
+    params_limit = {
+        "filter": 'metric.type = "serviceruntime.googleapis.com/quota/limit"',
+        "interval.startTime": start_str,
+        "interval.endTime": end_str,
+        "key": api_key
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            resp_use = await http.get(url, params=params_use)
+            resp_limit = await http.get(url, params=params_limit)
     except httpx.HTTPError as e:
-        # Network/DNS/timeout — transient. Return None (no toast), retry next tick.
-        log(f"API call failed: {e}")
+        log(f"Gemini Monitoring API call failed: {e}")
         return None
-    if resp.status_code in (401, 403):
-        # Genuine auth rejection — the ONLY case that warrants the actionable
-        # "run claude login" toast.
-        log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
-        raise AuthError(resp.status_code)
-    if resp.status_code >= 400:
-        # Other 4xx/5xx (rate-limit, server error) — transient, not a token issue.
-        log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
+        
+    if resp_use.status_code != 200 or resp_limit.status_code != 200:
+        log(f"Gemini API returned error status. Use: {resp_use.status_code}, Limit: {resp_limit.status_code}")
         return None
-
-    def hdr(name: str, default: str = "0") -> str:
-        return resp.headers.get(name, default)
-
-    now = time.time()
-
-    def reset_minutes(reset_ts: str) -> int:
-        try:
-            r = float(reset_ts)
-        except ValueError:
-            return 0
-        mins = (r - now) / 60.0
-        return int(round(mins)) if mins > 0 else 0
-
-    def pct(util: str) -> int:
-        try:
-            return int(round(float(util) * 100))
-        except ValueError:
-            return 0
-
-    if resp.headers.get("anthropic-ratelimit-unified-5h-utilization"):
-        payload = {
-            "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
-            "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
-            "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
-            "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
-            "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
-            "acct": "pro",
-            "ok": True,
-        }
-    else:
-        reset_ts = hdr("anthropic-ratelimit-unified-overage-reset")
-        payload = {
-            "s": pct(hdr("anthropic-ratelimit-unified-overage-utilization")),
-            "sr": reset_minutes(reset_ts),
-            "w": 0,
-            "wr": 0,
-            "st": hdr("anthropic-ratelimit-unified-status", "unknown"),
-            "acct": "ent",
-            **_billing_period_info(now, reset_ts),
-            "ok": True,
-        }
-    add_chime_field(payload)   # adds "c":1 iff the config opts in
-    add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
-    return payload
-
-
-def _billing_period_info(now: float, reset_ts: str) -> dict:
-    """Fraction of billing period elapsed (tp, 0-100) and period length in days (pd).
-
-    Monthly window is assumed (headers expose only reset_ts, not period). Per the
-    Claude Enterprise Admin API reference, spend-limit period's "only value today
-    is monthly" — see the macOS daemon for the full note.
-    """
+        
     try:
-        period_end = float(reset_ts)
-    except ValueError:
-        return {"tp": 0, "pd": 30, "rd": ""}
-    dt_end = datetime.datetime.fromtimestamp(period_end)
-    prev_month = dt_end.month - 1 or 12
-    prev_year = dt_end.year if dt_end.month > 1 else dt_end.year - 1
-    prev_day = min(dt_end.day, calendar.monthrange(prev_year, prev_month)[1])
-    dt_start = dt_end.replace(year=prev_year, month=prev_month, day=prev_day)
-    period_start = dt_start.timestamp()
-    period_len = period_end - period_start
-    if period_len <= 0:
-        return {"tp": 0, "pd": 30, "rd": ""}
-    pct_val = (now - period_start) / period_len * 100
+        use_json = resp_use.json()
+        limit_json = resp_limit.json()
+    except Exception as e:
+        log(f"Failed to parse Gemini monitoring JSON: {e}")
+        return None
+
+    def extract_latest_values(data: dict) -> dict:
+        metrics = {}
+        for ts in data.get("timeSeries", []):
+            qm = ts.get("metric", {}).get("labels", {}).get("quota_metric")
+            if not qm or not qm.startswith("generativelanguage.googleapis.com/"):
+                continue
+            points = ts.get("points", [])
+            if not points:
+                continue
+            latest_point = points[0]
+            val_dict = latest_point.get("value", {})
+            val = 0.0
+            if "int64Value" in val_dict:
+                val = float(val_dict["int64Value"])
+            elif "doubleValue" in val_dict:
+                val = float(val_dict["doubleValue"])
+            metrics[qm] = val
+        return metrics
+
+    use_metrics = extract_latest_values(use_json)
+    limit_metrics = extract_latest_values(limit_json)
+    
+    rpm_metric = "generativelanguage.googleapis.com/generate_content_free_tier_requests"
+    rpm_paid_metric = "generativelanguage.googleapis.com/generate_content_requests"
+    rpm_use = use_metrics.get(rpm_metric) or use_metrics.get(rpm_paid_metric) or 0.0
+    rpm_limit = limit_metrics.get(rpm_metric) or limit_metrics.get(rpm_paid_metric) or 15.0
+    
+    tpm_metric = "generativelanguage.googleapis.com/generate_content_free_tier_input_token_count"
+    tpm_paid_metric = "generativelanguage.googleapis.com/generate_content_input_token_count"
+    tpm_use = use_metrics.get(tpm_metric) or use_metrics.get(tpm_paid_metric) or 0.0
+    tpm_limit = limit_metrics.get(tpm_metric) or limit_metrics.get(tpm_paid_metric) or 1000000.0
+    
+    rpd_metric = "generativelanguage.googleapis.com/generate_content_requests_per_day"
+    rpd_use = use_metrics.get(rpd_metric) or 0.0
+    rpd_limit = limit_metrics.get(rpd_metric) or 1500.0
+    
+    rpm_pct = int(round((rpm_use / rpm_limit * 100.0))) if rpm_limit > 0 else 0
+    tpm_pct = int(round((tpm_use / tpm_limit * 100.0))) if tpm_limit > 0 else 0
+    rpd_pct = int(round((rpd_use / rpd_limit * 100.0))) if rpd_limit > 0 else 0
+    
+    session_pct = max(rpm_pct, tpm_pct)
+    weekly_pct = rpd_pct
+    
+    seconds_to_midnight = ((24 - now_dt.hour - 1) * 3600) + ((60 - now_dt.minute - 1) * 60) + (60 - now_dt.second)
+    rpd_reset_mins = max(0, int(seconds_to_midnight / 60))
+    
     return {
-        "tp": max(0, min(100, int(round(pct_val)))),
-        "pd": int(round(period_len / 86400)),
-        "rd": f"{dt_end.strftime('%b')} {dt_end.day}",
+        "s": min(100, max(0, session_pct)),
+        "sr": 1,
+        "w": min(100, max(0, weekly_pct)),
+        "wr": rpd_reset_mins,
+        "st": "allowed",
+        "ok": True
     }
 
 
-async def scan_for_device():
-    """Scan for DEVICE_NAME and return the BLEDevice, or None."""
-    log(f"Scanning for '{DEVICE_NAME}' ({SCAN_TIMEOUT}s)...")
-    device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=SCAN_TIMEOUT)
-    if device:
-        log(f"Found: {device.address}")
-    return device  # BLEDevice or None — NOT an address string
+def build_ble_payload(claude_payload: dict | None, gemini_payload: dict | None, agent_state: int = 0, agent_msg: str = "") -> dict:
+    payload = {"ok": False}
+    payload["a_st"] = agent_state
+    if agent_msg:
+        payload["a_msg"] = agent_msg[:32]
 
-
-def _mac_from_pnp_instance_id(instance_id: str) -> str | None:
-    """Recover a canonical BLE MAC ("AA:BB:CC:DD:EE:FF") from a PnP instance id.
-
-    Windows encodes a paired BLE device's address in its PnP instance id as a
-    12-hex run after a ``DEV_`` token, e.g.::
-
-        BTHLE\\DEV_98A316A5D706\\7&B8081D1&0&98A316A5D706  ->  98:A3:16:A5:D7:06
-
-    Returns None when no ``DEV_<12 hex>`` token is present. Pure — the
-    subprocess that produces the instance id lives in discover_bonded_address().
-    """
-    m = re.search(r"DEV_([0-9A-Fa-f]{12})(?![0-9A-Fa-f])", instance_id)
-    if not m:
-        return None
-    h = m.group(1).upper()
-    return ":".join(h[i:i + 2] for i in range(0, 12, 2))
-
-
-def discover_bonded_address() -> str | None:
-    """Return the BLE address of the bonded Clawdmeter, or None.
-
-    A device that is paired AND connected to Windows stops advertising, so
-    BleakScanner can't see it (the steady state once paired — see
-    README-windows.md). WinRT can still connect to it directly by address, so
-    we recover that address from the OS:
-
-    1. CLAWDMETER_BLE_ADDRESS env override (skips discovery — testing / pinning).
-    2. Windows PnP table, filtered to the device's FriendlyName.
-
-    Non-Windows or any failure returns None so the caller falls back to scanning.
-    """
-    if override := os.environ.get("CLAWDMETER_BLE_ADDRESS"):
-        return override.strip().upper()
-    if sys.platform != "win32":
-        return None
-    command = (
-        "Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | "
-        f"Where-Object {{ $_.FriendlyName -eq '{DEVICE_NAME}' }} | "
-        "Select-Object -ExpandProperty InstanceId"
-    )
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except (OSError, subprocess.SubprocessError) as e:
-        log(f"Bonded-address lookup failed: {e}")
-        return None
-    for line in result.stdout.splitlines():
-        if mac := _mac_from_pnp_instance_id(line):
-            return mac
-    return None
-
-
-async def acquire_target():
-    """Return a connectable handle for the Clawdmeter, or None.
-
-    Tries an advertisement scan first (works on a fresh boot before the device
-    is bonded-and-connected), then falls back to the bonded address (the steady
-    state, where the device is connected to Windows and no longer advertising).
-    Returns a BLEDevice, an address string, or None.
-    """
-    device = await scan_for_device()
-    if device:
-        return device
-    address = discover_bonded_address()
-    if not address:
-        return None
-    log(f"Not advertising; connecting to bonded address {address}")
-    # CRITICAL: hand BleakClient a BLEDevice, not the bare address string. WinRT's
-    # connect() resolves a bare string via an advertisement scan (find_device_by_address)
-    # — which always fails for a bonded device that has stopped advertising, the very
-    # case we are handling. A BLEDevice sets _device_info directly, so WinRT connects
-    # via from_bluetooth_address_with_bluetooth_address_type_async and skips the scan.
-    return BLEDevice(address, DEVICE_NAME, None)
-
-
-class Session:
-    def __init__(self, client: BleakClient) -> None:
-        self.client = client
-        self.refresh_requested = asyncio.Event()
-
-    def _on_refresh(self, _char, _data: bytearray) -> None:
-        log("Refresh requested by device")
-        self.refresh_requested.set()
-
-    async def setup_refresh_subscription(self) -> None:
-        # The refresh subscription is optional — the 60s poll loop works without it.
-        # WinRT's start_notify() CCCD write can raise a raw OSError/WinError (not
-        # wrapped as BleakError) when the peer GATT server is transiently unavailable,
-        # e.g. a just-power-cycled ESP32 whose server is not yet ready (G-03-01, SC#3).
-        # Degrade gracefully instead of crashing the daemon so it stays single-process
-        # across a power-cycle reconnect (SC#4, no restart).
-        try:
-            await self.client.start_notify(REQ_CHAR_UUID, self._on_refresh)
-        except (BleakError, ValueError, OSError) as e:
-            log(f"Refresh subscription unavailable: {e}")
-
-    async def write_payload(self, payload: dict) -> bool:
-        data = json.dumps(payload, separators=(",", ":")).encode()
-        log(f"Sending: {data.decode()}")
-        try:
-            await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
-            return True
-        except (BleakError, OSError) as e:
-            # WinRT can raise a raw OSError/WinError (NOT wrapped as BleakError)
-            # when the peer GATT server goes transiently unavailable mid-write —
-            # the same failure class setup_refresh_subscription() guards against.
-            # Returning False trips the zombie-link break -> clean reconnect,
-            # rather than an uncaught exception killing the daemon thread (the
-            # silent-freeze failure mode, SC#2 field report).
-            log(f"Write failed: {e}")
-            return False
-
-
-def _extract_access_token(blob: str) -> str | None:
-    """Pull the accessToken out of a credentials blob.
-
-    Claude Code stores credentials as a JSON object; the blob may also be
-    nested ({"claudeAiOauth": {"accessToken": "..."}}). Fall back to a
-    regex match so unexpected shapes still work, and finally treat the
-    blob as a raw token if nothing else matches.
-    """
-    blob = blob.strip()
-    if not blob:
-        return None
-    try:
-        data = json.loads(blob)
-    except json.JSONDecodeError:
-        data = None
-    if isinstance(data, dict):
-        # direct: {"accessToken": "..."}
-        tok = data.get("accessToken")
-        if isinstance(tok, str) and tok.strip():
-            return tok
-        # nested: {"claudeAiOauth": {"accessToken": "..."}}
-        for v in data.values():
-            if isinstance(v, dict):
-                tok = v.get("accessToken")
-                if isinstance(tok, str) and tok.strip():
-                    return tok
-    m = re.search(r'"accessToken"\s*:\s*"([^"]+)"', blob)
-    if m:
-        return m.group(1)
-    # Raw token (no JSON wrapper) — must look plausible (sk-ant-... etc.)
-    if re.fullmatch(r"[A-Za-z0-9_\-.~+/=]{20,}", blob):
-        return blob
-    return None
-
-
-def _windows_credential_candidates() -> list[Path]:
-    """Return the ordered list of credential file paths to probe (first hit wins).
-
-    Priority:
-    1. CLAUDE_CREDENTIALS_PATH env override (D-03, project-specific)
-    2. CLAUDE_CONFIG_DIR env override (official Claude override)
-    3. D-02 candidate list: home/.claude, LOCALAPPDATA/Claude, APPDATA/Claude
-    """
-    # Priority 1: project-specific env override (D-03)
-    if override := os.environ.get("CLAUDE_CREDENTIALS_PATH"):
-        return [Path(override)]
-    # Priority 2: official CLAUDE_CONFIG_DIR env override
-    if config_dir := os.environ.get("CLAUDE_CONFIG_DIR"):
-        return [Path(config_dir) / ".credentials.json"]
-    # Priority 3: D-02 candidate list — first hit wins
-    home = Path.home()
-    local_appdata = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
-    appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
-    return [
-        home / ".claude" / ".credentials.json",          # primary (confirmed by docs)
-        local_appdata / "Claude" / ".credentials.json",  # fallback 2
-        appdata / "Claude" / ".credentials.json",        # fallback 3
-    ]
-
-
-def read_token() -> str | None:
-    """Read the Claude OAuth access token from the first available credential file."""
-    for path in _windows_credential_candidates():
-        try:
-            return _extract_access_token(path.read_text(encoding="utf-8"))
-        except OSError:
-            continue
-    return None
-
-
-def _read_expiry() -> str:
-    """Return human-readable expiry from the first-hit credentials file.
-
-    Reads claudeAiOauth.expiresAt (epoch milliseconds — JS convention).
-    Divides by 1000 before passing to fromtimestamp (Python expects seconds).
-    Returns 'expiry unknown' on any parse failure.
-    """
-    for path in _windows_credential_candidates():
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        try:
-            data = json.loads(raw)
-            oauth = data.get("claudeAiOauth", {})
-            expires_ms = oauth.get("expiresAt")
-            if expires_ms is None:
-                return "expiry unknown"
-            # CRITICAL: expiresAt is JS-convention epoch milliseconds; divide by 1000
-            # before fromtimestamp (Python expects seconds). Raw value -> year ~57000.
-            dt = datetime.datetime.fromtimestamp(
-                expires_ms / 1000, tz=datetime.timezone.utc
-            )
-            return dt.strftime("%Y-%m-%d %H:%M UTC")
-        except (TypeError, ValueError, OSError, AttributeError, json.JSONDecodeError):
-            return "expiry unknown"
-    return "expiry unknown"
-
-
-async def _wait_first(*events: asyncio.Event, timeout: float) -> None:
-    """Return when any of `events` is set, or after `timeout` seconds.
-
-    Lets the poll loop's TICK wait wake immediately on a stop signal (clean,
-    responsive Quit) without losing the refresh-request wakeup — instead of
-    waiting only on refresh_requested and re-checking stop_event up to TICK
-    later. Cancels and drains the loser tasks so they don't warn.
-    """
-    tasks = [asyncio.ensure_future(e.wait()) for e in events]
-    try:
-        await asyncio.wait(tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
-    finally:
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-
-async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) -> bool:
-    """Connect to device and poll until disconnected or stopped.
-
-    Returns True if at least one successful write occurred.
-
-    `device` is a BLEDevice — either from an advertisement scan or built from the
-    bonded address by acquire_target(). The getattr keeps the log line robust if a
-    bare address string is ever passed in.
-    """
-    log(f"Connecting to {getattr(device, 'address', device)}...")
-    # D-01: retry wrapper — defeats WinRT post-wake failure modes
-    # (Could not get GATT services: Unreachable, stale is_connected).
-    # Rebuild a fresh BleakClient each attempt (locked D-05 recipe).
-    client = None
-    for attempt in range(CONNECT_RETRIES):
-        # D-05: pass BLEDevice (not address string), address_type="random" (NimBLE
-        # static-random), use_cached_services=False (DIY firmware — WinRT GATT cache
-        # may be stale after firmware reflash).
-        client = BleakClient(
-            device,
-            address_type="random",
-            use_cached_services=False,
-        )
-        try:
-            await client.connect()
-        except (BleakError, asyncio.TimeoutError) as e:
-            log(f"Connection attempt {attempt + 1}/{CONNECT_RETRIES} failed: {e}")
-            try:
-                await client.disconnect()
-            except BleakError:
-                pass
-            if attempt < CONNECT_RETRIES - 1:
-                await asyncio.sleep(CONNECT_RETRY_DELAY)
-            continue
-
-        if not client.is_connected:
-            log(f"Connection attempt {attempt + 1}/{CONNECT_RETRIES} failed (not connected)")
-            try:
-                await client.disconnect()
-            except BleakError:
-                pass
-            if attempt < CONNECT_RETRIES - 1:
-                await asyncio.sleep(CONNECT_RETRY_DELAY)
-            continue
-
-        # Connected successfully
-        break
+    if claude_payload and claude_payload.get("ok"):
+        payload["ok"] = True
+        payload["c_s"] = claude_payload.get("s", 0)
+        payload["c_sr"] = claude_payload.get("sr", 0)
+        payload["c_w"] = claude_payload.get("w", 0)
+        payload["c_wr"] = claude_payload.get("wr", 0)
+        payload["c_st"] = claude_payload.get("st", "unknown")
+        payload["c_acct"] = claude_payload.get("acct", "pro")
+        if "c" in claude_payload:
+            payload["c"] = claude_payload["c"]
+        if "t" in claude_payload:
+            payload["t"] = claude_payload["t"]
+        if "tf" in claude_payload:
+            payload["tf"] = claude_payload["tf"]
     else:
-        log(f"Connection failed after {CONNECT_RETRIES} attempts")
-        return False
+        payload["c_s"] = 0
+        payload["c_sr"] = 0
+        payload["c_w"] = 0
+        payload["c_wr"] = 0
+        payload["c_st"] = "error"
+        payload["c_acct"] = "pro"
 
-    log("Connected")
-    session = Session(client)
-    await session.setup_refresh_subscription()
+    if gemini_payload and gemini_payload.get("ok"):
+        payload["ok"] = True
+        payload["g_s"] = gemini_payload.get("s", 0)
+        payload["g_sr"] = gemini_payload.get("sr", 0)
+        payload["g_w"] = gemini_payload.get("w", 0)
+        payload["g_wr"] = gemini_payload.get("wr", 0)
+        payload["g_st"] = gemini_payload.get("st", "unknown")
+    else:
+        payload["g_s"] = 0
+        payload["g_sr"] = 0
+        payload["g_w"] = 0
+        payload["g_wr"] = 0
+        payload["g_st"] = "disabled" if not (read_gemini_api_key() and read_gemini_project_id()) else "error"
+        
+    return payload
 
-    last_poll = 0.0  # D-03: poll immediately on first connect
-    used_successfully = False
-    consecutive_failures = 0  # D-03: zombie-link break counter
+
+def read_esp32_ip() -> str:
+    """Read custom ESP32 IP address if specified in config, otherwise default to mDNS clawdmeter.local"""
     try:
-        while client.is_connected and not stop_event.is_set():
-            now = time.time()
-            elapsed = now - last_poll
-            if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
-                session.refresh_requested.clear()
-                token = read_token()  # D-09: fresh each cycle
-                if not token:
-                    log("No token; skipping poll")
-                    if tray_state:
-                        tray_state.set_error("token expired — run claude login")
-                else:
-                    try:
-                        payload = await poll_api(token)
-                    except AuthError:
-                        # Real 401/403 — token genuinely needs a refresh.
-                        if tray_state:
-                            tray_state.set_error("token expired — run claude login")
-                        payload = None
-                    if payload is not None:
-                        if await session.write_payload(payload):
-                            last_poll = time.time()
-                            used_successfully = True
-                            consecutive_failures = 0  # D-03: reset on success
-                            if tray_state:
-                                tray_state.set_connected(time.time())
-                        else:
-                            consecutive_failures += 1
-                            if consecutive_failures >= ZOMBIE_BREAK_LIMIT:
-                                log(
-                                    f"Zombie link detected ({consecutive_failures} consecutive"
-                                    f" write failures); abandoning connection"
-                                )
-                                break
-                    # else: payload is None from a TRANSIENT failure (network/DNS,
-                    # timeout, rate-limit, 5xx). poll_api already logged it; do NOT
-                    # toast "token expired" — that mislabeled a boot-time DNS blip
-                    # as an auth problem (SC#5). Leave tray state unchanged; the next
-                    # tick retries and set_connected() recovers it.
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                if key.strip().lower() == "esp32_ip":
+                    return val.strip()
+    except OSError:
+        pass
+    return "clawdmeter.local"
 
-            # Wake on a refresh request OR a stop, whichever comes first. Waking
-            # promptly on stop_event is what lets the finally below run
-            # client.disconnect() before the process exits, so the peer gets a
-            # clean GATT disconnect (returns to its waiting screen) instead of
-            # being left frozen on stale data after Quit (SC#3 graceful shutdown).
-            await _wait_first(session.refresh_requested, stop_event, timeout=TICK)
+
+def get_local_ip() -> str:
+    """Get the primary local network IP address of this computer"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('10.255.255.255', 1))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = '127.0.0.1'
     finally:
-        # Clean GATT disconnect on the way out — this is what tells the peripheral
-        # the link is gone. WinRT can surface a raw OSError (not BleakError) here,
-        # so swallow both; the link tears down regardless once we exit.
-        try:
-            await client.disconnect()
-        except (BleakError, OSError):
-            pass
-
-    log("Device disconnected" if not stop_event.is_set() else "Stopping")
-    return used_successfully
+        s.close()
+    return ip
 
 
-def _next_backoff(current: int, cap: int) -> int:
-    """D-05: double current backoff value, clamped to cap.
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Handle incoming approval responses from the ESP32 touch buttons"""
+    try:
+        data = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+    except Exception:
+        writer.close()
+        await writer.wait_closed()
+        return
 
-    Pure helper — unit-testable without driving the main loop.
-    Used by both slow-search (cap=60) and fast-reconnect (cap=RECONNECT_BACKOFF_CAP) regimes.
-    """
-    return min(current * 2, cap)
+    req = data.decode('utf-8', errors='ignore')
+    if "POST /api/response" in req:
+        parts = req.split("\r\n\r\n", 1)
+        if len(parts) > 1:
+            try:
+                body = json.loads(parts[1])
+                approved = body.get("approved", False)
+                log(f"Received Wi-Fi approval response from ESP32: {approved}")
+                response_path = Path(os.path.expanduser('~/.claude/approval_response.json'))
+                response_path.write_text(json.dumps({"approved": approved}), encoding="utf-8")
+            except Exception as e:
+                log(f"Failed to parse Wi-Fi approval response JSON: {e}")
+        
+        resp = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Connection: close\r\n\r\n"
+            '{"status":"ok"}'
+        )
+        writer.write(resp.encode())
+        await writer.drain()
+    else:
+        resp = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"
+        writer.write(resp.encode())
+        await writer.drain()
+        
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
 
 
 async def main(tray_state=None) -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
-    # Populate the shared state object so the tray can route Quit through
-    # loop.call_soon_threadsafe (RESEARCH Pitfall 2).  Additive — the existing
-    # stop_event = asyncio.Event() line above is unchanged.
     if tray_state is not None:
         tray_state.loop = loop
         tray_state.stop_event = stop_event
@@ -662,65 +603,143 @@ async def main(tray_state=None) -> None:
         log("Daemon stopping")
         stop_event.set()
 
-    # OS signal handlers can only be installed from the main thread, and
-    # loop.add_signal_handler is unsupported on Windows. When running under the
-    # tray (04-03) the loop lives in a background thread and the tray owns clean
-    # shutdown via stop_event (loop.call_soon_threadsafe), so skip silently there.
     if threading.current_thread() is threading.main_thread():
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, _stop)
             except NotImplementedError:
-                # Windows: add_signal_handler not supported; fall back to signal.signal
                 try:
                     signal.signal(sig, _stop)
                 except ValueError:
-                    # Not the main thread of the main interpreter — tray owns shutdown.
                     pass
 
-    log("=== Claude Usage Tracker Daemon (BLE, Windows) ===")
+    log("=== Claude Usage Tracker Daemon (Wi-Fi, Windows) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
 
-    # D-05: two distinct backoff regimes — slow-search (device absent) vs fast-reconnect (link dropped)
-    search_backoff = 1     # caps at 60s — gentle, for a device that is genuinely absent/off
-    reconnect_backoff = 1  # caps at RECONNECT_BACKOFF_CAP — fast, to clear the 120s SLA after a drop
-    while not stop_event.is_set():
-        device = await acquire_target()
-        if not device:
-            # Slow-search regime: device was not found by scan — back off gently
-            if tray_state:
-                tray_state.set_scanning()
-            log(f"Device not found, retrying in {search_backoff}s...")
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=search_backoff)
-            except asyncio.TimeoutError:
-                pass
-            search_backoff = _next_backoff(search_backoff, 60)
-            continue
+    server = await asyncio.start_server(handle_client, host='0.0.0.0', port=18989)
+    log("Started local HTTP server on port 18989 for remote approvals")
 
-        ok = await connect_and_run(device, stop_event, tray_state)
-        if not ok:
-            # Fast-reconnect regime: had/attempted a link that dropped — retry quickly
-            if tray_state:
-                tray_state.set_scanning()
-            log(f"Connection lost, reconnecting in {reconnect_backoff}s...")
+    last_poll = 0.0
+    
+    claude_payload_cache = None
+    gemini_payload_cache = None
+    
+    last_sent_agent_state = -1
+    last_sent_agent_msg = ""
+    
+    backoff = 1
+    
+    try:
+        while not stop_event.is_set():
+            agent_state = 0
+            agent_msg = ""
+            request_path = Path(os.path.expanduser('~/.claude/approval_request.json'))
+            if request_path.exists():
+                try:
+                    req_data = json.loads(request_path.read_text(encoding="utf-8"))
+                    req_state = req_data.get("state")
+                    if req_state == "needs_approval":
+                        agent_state = 2
+                        agent_msg = req_data.get("message", "Permission request")
+                    elif req_state == "working":
+                        agent_state = 1
+                        agent_msg = req_data.get("message", "Working...")
+                except Exception:
+                    pass
+
+            state_changed = (agent_state != last_sent_agent_state) or (agent_msg != last_sent_agent_msg)
+            
+            now = time.time()
+            elapsed = now - last_poll
+            
+            if elapsed >= POLL_INTERVAL or last_poll == 0.0 or not claude_payload_cache:
+                token = read_token()
+                claude_payload = None
+                if not token:
+                    log("No Claude token; skipping Claude poll")
+                    if tray_state:
+                        tray_state.set_error("token expired — run claude login")
+                else:
+                    try:
+                        claude_payload = await poll_api(token)
+                    except AuthError:
+                        if tray_state:
+                            tray_state.set_error("token expired — run claude login")
+                        claude_payload = None
+                    except Exception as e:
+                        log(f"Claude poll exception: {e}")
+                        claude_payload = None
+                
+                gemini_key = read_gemini_api_key()
+                gemini_pid = read_gemini_project_id()
+                gemini_payload = None
+                if gemini_key and gemini_pid:
+                    try:
+                        gemini_payload = await poll_gemini_usage(gemini_key, gemini_pid)
+                    except Exception as e:
+                        log(f"Gemini poll exception: {e}")
+                        gemini_payload = None
+                else:
+                    log("Gemini API key or project ID not configured; skipping Gemini poll")
+                    
+                claude_payload_cache = claude_payload
+                gemini_payload_cache = gemini_payload
+                last_poll = time.time()
+
+            payload = build_ble_payload(claude_payload_cache, gemini_payload_cache, agent_state, agent_msg)
+            payload["d_url"] = f"http://{get_local_ip()}:18989/api/response"
+
+            target_host = read_esp32_ip()
+            esp_url = f"http://{target_host}/api/payload"
+
+            if state_changed or elapsed >= POLL_INTERVAL or last_sent_agent_state == -1:
+                if payload.get("ok"):
+                    log(f"Sending payload to ESP32: {payload} -> {esp_url}")
+                    try:
+                        async with httpx.AsyncClient(timeout=4.0) as http:
+                            resp = await http.post(esp_url, json=payload)
+                        if resp.status_code == 200:
+                            # Save active IP for approval hook discovery
+                            try:
+                                ip_file = Path(os.path.expanduser('~/.claude/clawdmeter_ip.txt'))
+                                ip_file.parent.mkdir(parents=True, exist_ok=True)
+                                ip_file.write_text(target_host, encoding="utf-8")
+                            except Exception:
+                                pass
+                            
+                            last_sent_agent_state = agent_state
+                            last_sent_agent_msg = agent_msg
+                            if tray_state:
+                                tray_state.set_connected(time.time())
+                            backoff = 1
+                        else:
+                            log(f"ESP32 returned HTTP {resp.status_code}")
+                            raise Exception("Bad HTTP status")
+                    except Exception as e:
+                        log(f"Failed to send payload to ESP32: {e}")
+                        if tray_state:
+                            tray_state.set_scanning()
+                        try:
+                            await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                        except asyncio.TimeoutError:
+                            pass
+                        backoff = min(backoff * 2, 60)
+                        continue
+                else:
+                    log("Both Claude and Gemini polls failed; skipping write")
+
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=reconnect_backoff)
+                await asyncio.wait_for(stop_event.wait(), timeout=TICK)
             except asyncio.TimeoutError:
                 pass
-            reconnect_backoff = _next_backoff(reconnect_backoff, RECONNECT_BACKOFF_CAP)
-        else:
-            # Successful session — reset reconnect counter to floor; search_backoff also reset
-            reconnect_backoff = 1
-            search_backoff = 1
+    finally:
+        server.close()
+        await server.wait_closed()
+        log("HTTP server closed")
 
 
 if __name__ == "__main__":
-    if sys.platform != "win32":
-        print(
-            "Warning: running under Linux/WSL — WinRT BLE will not be available.",
-            file=sys.stderr,
-        )
+    import socket
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
