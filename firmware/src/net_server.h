@@ -28,3 +28,7 @@ void net_connect_home(void);
 void net_connect_phone(void);
 bool net_is_home_detected(void);
 void net_clear_home_detected(void);
+
+// Approval status management
+void net_set_approval_status(int status);
+int net_get_approval_status(void);

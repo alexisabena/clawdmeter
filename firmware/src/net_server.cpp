@@ -14,6 +14,18 @@ static char daemon_url[128] = "";
 #define NET_BUF_SIZE 512
 static char rx_buf[NET_BUF_SIZE];
 static volatile bool data_ready = false;
+static int approval_status = 0; // 0 = pending, 1 = allow_once, 2 = always_allow, 3 = deny
+
+static void handle_approval() {
+    String json_resp;
+    switch (approval_status) {
+        case 1:  json_resp = "{\"status\":\"allow_once\"}"; break;
+        case 2:  json_resp = "{\"status\":\"always_allow\"}"; break;
+        case 3:  json_resp = "{\"status\":\"deny\"}"; break;
+        default: json_resp = "{\"status\":\"pending\"}"; break;
+    }
+    server.send(200, "application/json", json_resp);
+}
 
 static void handle_payload() {
     if (server.method() != HTTP_POST) {
@@ -160,6 +172,7 @@ void net_tick(void) {
             // Set up web server endpoints (re-register on every connect)
             if (!server_started) {
                 server.on("/api/payload", handle_payload);
+                server.on("/api/approval", handle_approval);
                 server_started = true;
             }
             server.begin();
@@ -251,6 +264,15 @@ void net_send_response(const char* response) {
         Serial.printf("Wi-Fi: sent response to daemon, code=%d\n", httpResponseCode);
         http.end();
     }
+}
+
+void net_set_approval_status(int status) {
+    approval_status = status;
+    Serial.printf("Approval status changed: %d\n", status);
+}
+
+int net_get_approval_status(void) {
+    return approval_status;
 }
 
 void net_request_refresh(void) {}

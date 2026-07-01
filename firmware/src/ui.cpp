@@ -135,7 +135,8 @@ static bool has_cached_data = false;
 static lv_obj_t* approval_overlay = nullptr;
 static lv_obj_t* lbl_approval_title = nullptr;
 static lv_obj_t* lbl_approval_msg = nullptr;
-static lv_obj_t* btn_approve = nullptr;
+static lv_obj_t* btn_allow_once = nullptr;
+static lv_obj_t* btn_always_allow = nullptr;
 static lv_obj_t* btn_deny = nullptr;
 
 static lv_obj_t* wifi_modal = nullptr;
@@ -402,10 +403,20 @@ static void build_idle_group(lv_obj_t* parent) {
 
 #include "net_server.h"
 
-static void approve_click_cb(lv_event_t* e) {
+static void allow_once_click_cb(lv_event_t* e) {
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_CLICKED) {
-        net_send_response("{\"approved\":true}");
+        net_set_approval_status(1); // 1 = allow once
+        if (approval_overlay) lv_obj_add_flag(approval_overlay, LV_OBJ_FLAG_HIDDEN);
+        cached_data.agent_state = 0;
+        ui_update(nullptr);
+    }
+}
+
+static void always_allow_click_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        net_set_approval_status(2); // 2 = always allow
         if (approval_overlay) lv_obj_add_flag(approval_overlay, LV_OBJ_FLAG_HIDDEN);
         cached_data.agent_state = 0;
         ui_update(nullptr);
@@ -415,7 +426,7 @@ static void approve_click_cb(lv_event_t* e) {
 static void deny_click_cb(lv_event_t* e) {
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_CLICKED) {
-        net_send_response("{\"approved\":false}");
+        net_set_approval_status(3); // 3 = deny
         if (approval_overlay) lv_obj_add_flag(approval_overlay, LV_OBJ_FLAG_HIDDEN);
         cached_data.agent_state = 0;
         ui_update(nullptr);
@@ -632,27 +643,39 @@ static void build_approval_overlay(lv_obj_t* parent) {
     lv_obj_set_style_text_align(lbl_approval_msg, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(lbl_approval_msg, LV_ALIGN_CENTER, 0, -20);
 
-    btn_approve = lv_button_create(approval_overlay);
-    lv_obj_set_size(btn_approve, L.scr_w / 2 - 30, 60);
-    lv_obj_align(btn_approve, LV_ALIGN_BOTTOM_LEFT, 10, -50);
-    lv_obj_set_style_bg_color(btn_approve, COL_GREEN, 0);
-    lv_obj_add_event_cb(btn_approve, approve_click_cb, LV_EVENT_CLICKED, NULL);
+    btn_allow_once = lv_button_create(approval_overlay);
+    lv_obj_set_size(btn_allow_once, L.scr_w - 40, 48);
+    lv_obj_align(btn_allow_once, LV_ALIGN_BOTTOM_MID, 0, -135);
+    lv_obj_set_style_bg_color(btn_allow_once, COL_GREEN, 0);
+    lv_obj_add_event_cb(btn_allow_once, allow_once_click_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t* lbl_btn_app = lv_label_create(btn_approve);
-    lv_label_set_text(lbl_btn_app, "Approve");
-    lv_obj_set_style_text_font(lbl_btn_app, &font_styrene_20, 0);
+    lv_obj_t* lbl_btn_app = lv_label_create(btn_allow_once);
+    lv_label_set_text(lbl_btn_app, "Allow Once");
+    lv_obj_set_style_text_font(lbl_btn_app, &font_styrene_16, 0);
     lv_obj_set_style_text_color(lbl_btn_app, COL_TEXT, 0);
     lv_obj_align(lbl_btn_app, LV_ALIGN_CENTER, 0, 0);
 
+    btn_always_allow = lv_button_create(approval_overlay);
+    lv_obj_set_size(btn_always_allow, L.scr_w - 40, 48);
+    lv_obj_align(btn_always_allow, LV_ALIGN_BOTTOM_MID, 0, -75);
+    lv_obj_set_style_bg_color(btn_always_allow, COL_ACCENT, 0);
+    lv_obj_add_event_cb(btn_always_allow, always_allow_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* lbl_btn_always = lv_label_create(btn_always_allow);
+    lv_label_set_text(lbl_btn_always, "Always Allow");
+    lv_obj_set_style_text_font(lbl_btn_always, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_btn_always, COL_TEXT, 0);
+    lv_obj_align(lbl_btn_always, LV_ALIGN_CENTER, 0, 0);
+
     btn_deny = lv_button_create(approval_overlay);
-    lv_obj_set_size(btn_deny, L.scr_w / 2 - 30, 60);
-    lv_obj_align(btn_deny, LV_ALIGN_BOTTOM_RIGHT, -10, -50);
+    lv_obj_set_size(btn_deny, L.scr_w - 40, 48);
+    lv_obj_align(btn_deny, LV_ALIGN_BOTTOM_MID, 0, -15);
     lv_obj_set_style_bg_color(btn_deny, COL_RED, 0);
     lv_obj_add_event_cb(btn_deny, deny_click_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* lbl_btn_deny = lv_label_create(btn_deny);
     lv_label_set_text(lbl_btn_deny, "Deny");
-    lv_obj_set_style_text_font(lbl_btn_deny, &font_styrene_20, 0);
+    lv_obj_set_style_text_font(lbl_btn_deny, &font_styrene_16, 0);
     lv_obj_set_style_text_color(lbl_btn_deny, COL_TEXT, 0);
     lv_obj_align(lbl_btn_deny, LV_ALIGN_CENTER, 0, 0);
 

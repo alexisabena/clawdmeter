@@ -536,61 +536,6 @@ def read_esp32_ip() -> str:
     return "clawdmeter.local"
 
 
-def get_local_ip() -> str:
-    """Get the primary local network IP address of this computer"""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(('10.255.255.255', 1))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = '127.0.0.1'
-    finally:
-        s.close()
-    return ip
-
-
-async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    """Handle incoming approval responses from the ESP32 touch buttons"""
-    try:
-        data = await asyncio.wait_for(reader.read(1024), timeout=5.0)
-    except Exception:
-        writer.close()
-        await writer.wait_closed()
-        return
-
-    req = data.decode('utf-8', errors='ignore')
-    if "POST /api/response" in req:
-        parts = req.split("\r\n\r\n", 1)
-        if len(parts) > 1:
-            try:
-                body = json.loads(parts[1])
-                approved = body.get("approved", False)
-                log(f"Received Wi-Fi approval response from ESP32: {approved}")
-                response_path = Path(os.path.expanduser('~/.claude/approval_response.json'))
-                response_path.write_text(json.dumps({"approved": approved}), encoding="utf-8")
-            except Exception as e:
-                log(f"Failed to parse Wi-Fi approval response JSON: {e}")
-        
-        resp = (
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Connection: close\r\n\r\n"
-            '{"status":"ok"}'
-        )
-        writer.write(resp.encode())
-        await writer.drain()
-    else:
-        resp = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"
-        writer.write(resp.encode())
-        await writer.drain()
-        
-    writer.close()
-    try:
-        await writer.wait_closed()
-    except Exception:
-        pass
-
-
 async def main(tray_state=None) -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -615,9 +560,6 @@ async def main(tray_state=None) -> None:
 
     log("=== Claude Usage Tracker Daemon (Wi-Fi, Windows) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
-
-    server = await asyncio.start_server(handle_client, host='0.0.0.0', port=18989)
-    log("Started local HTTP server on port 18989 for remote approvals")
 
     last_poll = 0.0
     
@@ -687,7 +629,6 @@ async def main(tray_state=None) -> None:
                 last_poll = time.time()
 
             payload = build_ble_payload(claude_payload_cache, gemini_payload_cache, agent_state, agent_msg)
-            payload["d_url"] = f"http://{get_local_ip()}:18989/api/response"
 
             target_host = read_esp32_ip()
             esp_url = f"http://{target_host}/api/payload"
@@ -733,9 +674,7 @@ async def main(tray_state=None) -> None:
             except asyncio.TimeoutError:
                 pass
     finally:
-        server.close()
-        await server.wait_closed()
-        log("HTTP server closed")
+        pass
 
 
 if __name__ == "__main__":

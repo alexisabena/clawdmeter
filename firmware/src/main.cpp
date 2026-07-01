@@ -123,7 +123,11 @@ static bool parse_json(const char* json, UsageData* out) {
     out->gemini.valid = doc.containsKey("g_s");
 
     // Parse agent state
-    out->agent_state = doc["a_st"] | 0;
+    int next_agent_state = doc["a_st"] | 0;
+    if (next_agent_state == 2 && out->agent_state != 2) {
+        net_set_approval_status(0); // reset to pending on new request
+    }
+    out->agent_state = next_agent_state;
     strlcpy(out->agent_msg, doc["a_msg"] | "", sizeof(out->agent_msg));
 
     // General fields
