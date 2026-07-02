@@ -24,6 +24,7 @@ struct ChimeConfig {
 // Bring up I2S + the ES8311 codec. Returns true on success; false leaves the
 // engine inert (chime_play becomes a no-op). Wire/I2C must already be up.
 bool chime_init(const ChimeConfig& cfg);
+void chime_deinit(void);
 
 // Queue one playback of the embedded clip (non-blocking). No-op if not ready
 // or already playing.

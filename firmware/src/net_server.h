@@ -32,3 +32,7 @@ void net_clear_home_detected(void);
 // Approval status management
 void net_set_approval_status(int status);
 int net_get_approval_status(void);
+
+// Sync request management
+bool net_get_sync_requested(void);
+void net_set_sync_requested(bool req);

@@ -5,6 +5,10 @@
 #include "logo.h"
 #include "icons.h"
 #include "hal/board_caps.h"
+#include "settings.h"
+#include "sd_recorder.h"
+#include <ArduinoJson.h>
+#include "hal/sound_hal.h"
 
 // Custom fonts (scaled for 314 PPI, ~1.9x from original 165 PPI)
 LV_FONT_DECLARE(font_tiempos_56);
@@ -146,12 +150,27 @@ static lv_obj_t* btn_wifi_modal_ok = nullptr;
 static lv_obj_t* btn_wifi_modal_cancel = nullptr;
 static bool wifi_modal_is_home_prompt = true;
 
-static lv_obj_t* settings_modal = nullptr;
+static lv_obj_t* settings_shade = nullptr;
 static lv_obj_t* lbl_settings_title = nullptr;
 static lv_obj_t* lbl_settings_info = nullptr;
 static lv_obj_t* btn_settings_home = nullptr;
 static lv_obj_t* btn_settings_phone = nullptr;
+static lv_obj_t* btn_mute_token = nullptr;
+static lv_obj_t* btn_mute_permission = nullptr;
+static lv_obj_t* lbl_mute_token = nullptr;
+static lv_obj_t* lbl_mute_permission = nullptr;
 static lv_obj_t* btn_settings_close = nullptr;
+
+static lv_obj_t* recorder_container = nullptr;
+static lv_obj_t* lbl_recorder_title = nullptr;
+static lv_obj_t* lbl_sd_status = nullptr;
+static lv_obj_t* btn_record = nullptr;
+static lv_obj_t* lbl_btn_record = nullptr;
+static lv_obj_t* btn_sync = nullptr;
+static lv_obj_t* lbl_btn_sync = nullptr;
+static lv_obj_t* list_memos = nullptr;
+static lv_obj_t* lbl_rec_duration = nullptr;
+static lv_timer_t* rec_timer = nullptr;
 
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
@@ -252,8 +271,20 @@ static void panel_click_cb(lv_event_t* e);
 static void logo_click_cb(lv_event_t* e);
 static void settings_home_click_cb(lv_event_t* e);
 static void settings_phone_click_cb(lv_event_t* e);
-static void settings_close_click_cb(lv_event_t* e);
-static void build_settings_modal(lv_obj_t* parent);
+static void settings_shade_close_cb(lv_event_t* e);
+static void mute_token_click_cb(lv_event_t* e);
+static void mute_permission_click_cb(lv_event_t* e);
+static void screen_gesture_cb(lv_event_t* e);
+static void settings_shade_gesture_cb(lv_event_t* e);
+static void build_settings_shade(lv_obj_t* parent);
+static void update_settings_buttons_labels(void);
+
+// Recorder forward decls
+static void record_click_cb(lv_event_t* e);
+static void sync_click_cb(lv_event_t* e);
+static void recorder_timer_cb(lv_timer_t* t);
+static void refresh_recordings_list(void);
+static void build_recorder_container(lv_obj_t* parent);
 
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
@@ -459,7 +490,7 @@ static void logo_click_cb(lv_event_t* e) {
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_CLICKED) {
         lv_event_stop_processing(e);
-        if (settings_modal) {
+        if (settings_shade) {
             char info_buf[128];
             const char* net_name = net_is_using_home() ? "Home Wi-Fi" : "Phone Hotspot";
             const char* status_str = "Disconnected";
@@ -471,8 +502,10 @@ static void logo_click_cb(lv_event_t* e) {
                 "Active Net: %s\nStatus: %s\nIP: %s", 
                 net_name, status_str, net_get_ip_address());
             lv_label_set_text(lbl_settings_info, info_buf);
+            update_settings_buttons_labels();
             
-            lv_obj_remove_flag(settings_modal, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(settings_shade, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_y(settings_shade, 0); // Slide down
         }
     }
 }
@@ -481,7 +514,10 @@ static void settings_home_click_cb(lv_event_t* e) {
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_CLICKED) {
         net_connect_home();
-        if (settings_modal) lv_obj_add_flag(settings_modal, LV_OBJ_FLAG_HIDDEN);
+        if (settings_shade) {
+            lv_obj_set_y(settings_shade, -L.scr_h);
+            lv_obj_add_flag(settings_shade, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
@@ -489,47 +525,121 @@ static void settings_phone_click_cb(lv_event_t* e) {
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_CLICKED) {
         net_connect_phone();
-        if (settings_modal) lv_obj_add_flag(settings_modal, LV_OBJ_FLAG_HIDDEN);
+        if (settings_shade) {
+            lv_obj_set_y(settings_shade, -L.scr_h);
+            lv_obj_add_flag(settings_shade, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
-static void settings_close_click_cb(lv_event_t* e) {
+static void settings_shade_close_cb(lv_event_t* e) {
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_CLICKED) {
-        if (settings_modal) lv_obj_add_flag(settings_modal, LV_OBJ_FLAG_HIDDEN);
+        if (settings_shade) {
+            lv_obj_set_y(settings_shade, -L.scr_h);
+            lv_obj_add_flag(settings_shade, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
-static void build_settings_modal(lv_obj_t* parent) {
-    settings_modal = lv_obj_create(parent);
-    lv_obj_set_size(settings_modal, L.scr_w - 40, L.scr_h - 100);
-    lv_obj_align(settings_modal, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(settings_modal, lv_color_hex(0x1a1a24), 0); // dark grey-blue
-    lv_obj_set_style_bg_opa(settings_modal, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(settings_modal, 2, 0);
-    lv_obj_set_style_border_color(settings_modal, COL_ACCENT, 0);
-    lv_obj_set_style_pad_all(settings_modal, 15, 0);
-    lv_obj_clear_flag(settings_modal, LV_OBJ_FLAG_SCROLLABLE);
+static void mute_token_click_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        settings_set_mute_token(!settings_get_mute_token());
+        update_settings_buttons_labels();
+    }
+}
 
-    lbl_settings_title = lv_label_create(settings_modal);
+static void mute_permission_click_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        settings_set_mute_permission(!settings_get_mute_permission());
+        update_settings_buttons_labels();
+    }
+}
+
+static void screen_gesture_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_GESTURE) {
+        lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+        if (dir == LV_DIR_BOTTOM) {
+            if (settings_shade) {
+                char info_buf[128];
+                const char* net_name = net_is_using_home() ? "Home Wi-Fi" : "Phone Hotspot";
+                const char* status_str = "Disconnected";
+                net_state_t ns = net_get_state();
+                if (ns == NET_STATE_CONNECTED) status_str = "Connected";
+                else if (ns == NET_STATE_CONNECTING) status_str = "Connecting";
+                
+                snprintf(info_buf, sizeof(info_buf), 
+                    "Active Net: %s\nStatus: %s\nIP: %s", 
+                    net_name, status_str, net_get_ip_address());
+                lv_label_set_text(lbl_settings_info, info_buf);
+                update_settings_buttons_labels();
+
+                lv_obj_remove_flag(settings_shade, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_y(settings_shade, 0); // Slide down
+            }
+        }
+    }
+}
+
+static void settings_shade_gesture_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_GESTURE) {
+        lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+        if (dir == LV_DIR_TOP) {
+            if (settings_shade) {
+                lv_obj_set_y(settings_shade, -L.scr_h);
+                lv_obj_add_flag(settings_shade, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    }
+}
+
+static void update_settings_buttons_labels(void) {
+    if (lbl_mute_token) {
+        bool mute = settings_get_mute_token();
+        lv_label_set_text(lbl_mute_token, mute ? "Token Alert: Silent" : "Token Alert: Chime");
+        lv_obj_set_style_bg_color(btn_mute_token, mute ? COL_RED : COL_GREEN, 0);
+    }
+    if (lbl_mute_permission) {
+        bool mute = settings_get_mute_permission();
+        lv_label_set_text(lbl_mute_permission, mute ? "Permission: Silent" : "Permission: Chime");
+        lv_obj_set_style_bg_color(btn_mute_permission, mute ? COL_RED : COL_GREEN, 0);
+    }
+}
+
+static void build_settings_shade(lv_obj_t* parent) {
+    settings_shade = lv_obj_create(parent);
+    lv_obj_set_size(settings_shade, L.scr_w, L.scr_h);
+    lv_obj_set_pos(settings_shade, 0, -L.scr_h); // Hidden above top screen
+    lv_obj_set_style_bg_color(settings_shade, lv_color_hex(0x1a1a24), 0); // dark grey-blue
+    lv_obj_set_style_bg_opa(settings_shade, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(settings_shade, 0, 0);
+    lv_obj_set_style_pad_all(settings_shade, 15, 0);
+    lv_obj_clear_flag(settings_shade, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(settings_shade, settings_shade_gesture_cb, LV_EVENT_GESTURE, NULL);
+
+    lbl_settings_title = lv_label_create(settings_shade);
     lv_label_set_text(lbl_settings_title, "Settings");
     lv_obj_set_style_text_font(lbl_settings_title, &font_styrene_24, 0);
     lv_obj_set_style_text_color(lbl_settings_title, COL_TEXT, 0);
     lv_obj_align(lbl_settings_title, LV_ALIGN_TOP_MID, 0, 5);
 
-    lbl_settings_info = lv_label_create(settings_modal);
+    lbl_settings_info = lv_label_create(settings_shade);
     lv_label_set_text(lbl_settings_info, "");
     lv_label_set_long_mode(lbl_settings_info, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(lbl_settings_info, L.scr_w - 80);
+    lv_obj_set_width(lbl_settings_info, L.scr_w - 60);
     lv_obj_set_style_text_font(lbl_settings_info, &font_styrene_16, 0);
     lv_obj_set_style_text_color(lbl_settings_info, COL_DIM, 0);
     lv_obj_set_style_text_align(lbl_settings_info, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(lbl_settings_info, LV_ALIGN_TOP_MID, 0, 45);
 
     // Switch to Home button
-    btn_settings_home = lv_button_create(settings_modal);
-    lv_obj_set_size(btn_settings_home, L.scr_w - 80, 45);
-    lv_obj_align(btn_settings_home, LV_ALIGN_TOP_MID, 0, 120);
+    btn_settings_home = lv_button_create(settings_shade);
+    lv_obj_set_size(btn_settings_home, L.scr_w - 40, 40);
+    lv_obj_align(btn_settings_home, LV_ALIGN_TOP_MID, 0, 115);
     lv_obj_set_style_bg_color(btn_settings_home, lv_color_hex(0x282c34), 0);
     lv_obj_add_event_cb(btn_settings_home, settings_home_click_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t* lbl_h = lv_label_create(btn_settings_home);
@@ -539,9 +649,9 @@ static void build_settings_modal(lv_obj_t* parent) {
     lv_obj_align(lbl_h, LV_ALIGN_CENTER, 0, 0);
 
     // Switch to Phone button
-    btn_settings_phone = lv_button_create(settings_modal);
-    lv_obj_set_size(btn_settings_phone, L.scr_w - 80, 45);
-    lv_obj_align(btn_settings_phone, LV_ALIGN_TOP_MID, 0, 175);
+    btn_settings_phone = lv_button_create(settings_shade);
+    lv_obj_set_size(btn_settings_phone, L.scr_w - 40, 40);
+    lv_obj_align(btn_settings_phone, LV_ALIGN_TOP_MID, 0, 165);
     lv_obj_set_style_bg_color(btn_settings_phone, lv_color_hex(0x282c34), 0);
     lv_obj_add_event_cb(btn_settings_phone, settings_phone_click_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t* lbl_p = lv_label_create(btn_settings_phone);
@@ -550,19 +660,40 @@ static void build_settings_modal(lv_obj_t* parent) {
     lv_obj_set_style_text_color(lbl_p, COL_TEXT, 0);
     lv_obj_align(lbl_p, LV_ALIGN_CENTER, 0, 0);
 
+    // Mute Token Toggle button
+    btn_mute_token = lv_button_create(settings_shade);
+    lv_obj_set_size(btn_mute_token, L.scr_w - 40, 40);
+    lv_obj_align(btn_mute_token, LV_ALIGN_TOP_MID, 0, 215);
+    lv_obj_add_event_cb(btn_mute_token, mute_token_click_cb, LV_EVENT_CLICKED, NULL);
+    lbl_mute_token = lv_label_create(btn_mute_token);
+    lv_obj_set_style_text_font(lbl_mute_token, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_mute_token, COL_TEXT, 0);
+    lv_obj_align(lbl_mute_token, LV_ALIGN_CENTER, 0, 0);
+
+    // Mute Permission Toggle button
+    btn_mute_permission = lv_button_create(settings_shade);
+    lv_obj_set_size(btn_mute_permission, L.scr_w - 40, 40);
+    lv_obj_align(btn_mute_permission, LV_ALIGN_TOP_MID, 0, 265);
+    lv_obj_add_event_cb(btn_mute_permission, mute_permission_click_cb, LV_EVENT_CLICKED, NULL);
+    lbl_mute_permission = lv_label_create(btn_mute_permission);
+    lv_obj_set_style_text_font(lbl_mute_permission, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_mute_permission, COL_TEXT, 0);
+    lv_obj_align(lbl_mute_permission, LV_ALIGN_CENTER, 0, 0);
+
     // Close button
-    btn_settings_close = lv_button_create(settings_modal);
-    lv_obj_set_size(btn_settings_close, L.scr_w - 80, 45);
-    lv_obj_align(btn_settings_close, LV_ALIGN_BOTTOM_MID, 0, -5);
+    btn_settings_close = lv_button_create(settings_shade);
+    lv_obj_set_size(btn_settings_close, L.scr_w - 40, 40);
+    lv_obj_align(btn_settings_close, LV_ALIGN_BOTTOM_MID, 0, -20);
     lv_obj_set_style_bg_color(btn_settings_close, COL_RED, 0);
-    lv_obj_add_event_cb(btn_settings_close, settings_close_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(btn_settings_close, settings_shade_close_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t* lbl_c = lv_label_create(btn_settings_close);
     lv_label_set_text(lbl_c, "Close");
     lv_obj_set_style_text_font(lbl_c, &font_styrene_16, 0);
     lv_obj_set_style_text_color(lbl_c, COL_TEXT, 0);
     lv_obj_align(lbl_c, LV_ALIGN_CENTER, 0, 0);
 
-    lv_obj_add_flag(settings_modal, LV_OBJ_FLAG_HIDDEN);
+    update_settings_buttons_labels();
+    lv_obj_add_flag(settings_shade, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void build_wifi_modal(lv_obj_t* parent) {
@@ -682,6 +813,214 @@ static void build_approval_overlay(lv_obj_t* parent) {
     lv_obj_add_flag(approval_overlay, LV_OBJ_FLAG_HIDDEN);
 }
 
+static void recorder_gesture_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_GESTURE) {
+        lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+        if (dir == LV_DIR_RIGHT) { // Swipe right to go back to usage
+            if (recorder_container && usage_container) {
+                lv_obj_add_flag(recorder_container, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_remove_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    }
+}
+
+static void usage_gesture_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_GESTURE) {
+        lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+        if (dir == LV_DIR_LEFT) { // Swipe left to open recorder
+            if (usage_container && recorder_container) {
+                lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_remove_flag(recorder_container, LV_OBJ_FLAG_HIDDEN);
+                refresh_recordings_list();
+            }
+        }
+    }
+}
+
+static void record_click_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        if (!sd_recorder_is_sd_mounted()) return;
+        
+        if (sd_recorder_is_recording()) {
+            sd_recorder_stop();
+            // Wait slightly for file to close and WAV header to update
+            delay(100);
+            uint32_t duration_sec = sd_recorder_get_record_duration_ms() / 1000;
+            const char* fn = sd_recorder_get_active_filename();
+            sd_recorder_add_history_entry(fn, duration_sec);
+            refresh_recordings_list();
+        } else {
+            char filename[64];
+            snprintf(filename, sizeof(filename), "insight_%u.wav", (uint32_t)time(nullptr));
+            sd_recorder_start(filename);
+        }
+    }
+}
+
+static void sync_click_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        bool is_home = net_is_using_home() && (net_get_state() == NET_STATE_CONNECTED);
+        if (is_home) {
+            net_set_sync_requested(true);
+            lv_label_set_text(lbl_btn_sync, "Syncing...");
+        }
+    }
+}
+
+static void recorder_timer_cb(lv_timer_t* t) {
+    if (!recorder_container || lv_obj_has_flag(recorder_container, LV_OBJ_FLAG_HIDDEN)) {
+        return;
+    }
+    
+    // Update SD status
+    if (sd_recorder_is_sd_mounted()) {
+        lv_label_set_text(lbl_sd_status, "SD Card: Ready");
+        lv_obj_set_style_text_color(lbl_sd_status, COL_GREEN, 0);
+    } else {
+        lv_label_set_text(lbl_sd_status, "SD Card: Not Found");
+        lv_obj_set_style_text_color(lbl_sd_status, COL_RED, 0);
+    }
+
+    // Update record state
+    if (sd_recorder_is_recording()) {
+        uint32_t dur = sd_recorder_get_record_duration_ms() / 1000;
+        char dur_buf[32];
+        snprintf(dur_buf, sizeof(dur_buf), "Recording... %02u:%02u", dur / 60, dur % 60);
+        lv_label_set_text(lbl_rec_duration, dur_buf);
+        lv_label_set_text(lbl_btn_record, "Stop");
+        lv_obj_set_style_bg_color(btn_record, COL_RED, 0);
+    } else {
+        lv_label_set_text(lbl_rec_duration, "Idle");
+        lv_label_set_text(lbl_btn_record, "Record");
+        lv_obj_set_style_bg_color(btn_record, lv_color_hex(0x282c34), 0);
+    }
+
+    // Update sync button state
+    bool is_home = net_is_using_home() && (net_get_state() == NET_STATE_CONNECTED);
+    if (is_home) {
+        if (!net_get_sync_requested()) {
+            lv_label_set_text(lbl_btn_sync, "Sync to PC");
+        }
+        lv_obj_remove_state(btn_sync, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_color(btn_sync, COL_ACCENT, 0);
+    } else {
+        lv_label_set_text(lbl_btn_sync, "Sync (Home Wi-Fi Only)");
+        lv_obj_add_state(btn_sync, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_color(btn_sync, lv_color_hex(0x404040), 0);
+    }
+}
+
+static void refresh_recordings_list(void) {
+    if (!list_memos) return;
+    
+    // Clear list children
+    uint32_t cnt = lv_obj_get_child_count(list_memos);
+    for (int i = (int)cnt - 1; i >= 0; i--) {
+        lv_obj_t* child = lv_obj_get_child(list_memos, i);
+        lv_obj_delete(child);
+    }
+
+    String history_raw = sd_recorder_get_history_json();
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, history_raw);
+    if (err) return;
+    
+    if (doc.is<JsonArray>()) {
+        JsonArray arr = doc.as<JsonArray>();
+        // Read in reverse order so newest is at the top
+        for (int i = (int)arr.size() - 1; i >= 0; i--) {
+            JsonObject obj = arr[i];
+            const char* date_str = obj["date"] | "Unknown";
+            int duration = obj["duration"] | 0;
+            bool uploaded = obj["uploaded"] | false;
+            
+            char item_buf[64];
+            snprintf(item_buf, sizeof(item_buf), "%s (%ds)", date_str, duration);
+            
+            lv_obj_t* btn = lv_list_add_button(list_memos, uploaded ? LV_SYMBOL_OK : LV_SYMBOL_AUDIO, item_buf);
+            
+            if (uploaded) {
+                lv_obj_set_style_text_color(btn, COL_DIM, 0);
+                lv_obj_set_style_opa(btn, LV_OPA_60, 0);
+            } else {
+                lv_obj_set_style_text_color(btn, COL_TEXT, 0);
+            }
+        }
+    }
+}
+
+static void build_recorder_container(lv_obj_t* parent) {
+    recorder_container = lv_obj_create(parent);
+    lv_obj_set_size(recorder_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(recorder_container, 0, 0);
+    lv_obj_set_style_bg_opa(recorder_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(recorder_container, 0, 0);
+    lv_obj_set_style_pad_all(recorder_container, 0, 0);
+    lv_obj_clear_flag(recorder_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(recorder_container, recorder_gesture_cb, LV_EVENT_GESTURE, NULL);
+
+    lbl_recorder_title = lv_label_create(recorder_container);
+    lv_label_set_text(lbl_recorder_title, "Insights");
+    lv_obj_set_style_text_font(lbl_recorder_title, &font_tiempos_56, 0);
+    lv_obj_set_style_text_color(lbl_recorder_title, COL_TEXT, 0);
+    lv_obj_align(lbl_recorder_title, LV_ALIGN_TOP_MID, 0, L.title_y);
+
+    lbl_sd_status = lv_label_create(recorder_container);
+    lv_label_set_text(lbl_sd_status, "SD Card: Ready");
+    lv_obj_set_style_text_font(lbl_sd_status, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_sd_status, COL_GREEN, 0);
+    lv_obj_align(lbl_sd_status, LV_ALIGN_TOP_MID, 0, L.title_y + 60);
+
+    lbl_rec_duration = lv_label_create(recorder_container);
+    lv_label_set_text(lbl_rec_duration, "Idle");
+    lv_obj_set_style_text_font(lbl_rec_duration, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_rec_duration, COL_DIM, 0);
+    lv_obj_align(lbl_rec_duration, LV_ALIGN_TOP_MID, 0, L.title_y + 85);
+
+    // Record button
+    btn_record = lv_button_create(recorder_container);
+    lv_obj_set_size(btn_record, L.scr_w / 2 - 25, 45);
+    lv_obj_align(btn_record, LV_ALIGN_TOP_LEFT, 20, L.title_y + 115);
+    lv_obj_set_style_bg_color(btn_record, lv_color_hex(0x282c34), 0);
+    lv_obj_add_event_cb(btn_record, record_click_cb, LV_EVENT_CLICKED, NULL);
+    lbl_btn_record = lv_label_create(btn_record);
+    lv_label_set_text(lbl_btn_record, "Record");
+    lv_obj_set_style_text_font(lbl_btn_record, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_btn_record, COL_TEXT, 0);
+    lv_obj_align(lbl_btn_record, LV_ALIGN_CENTER, 0, 0);
+
+    // Sync button
+    btn_sync = lv_button_create(recorder_container);
+    lv_obj_set_size(btn_sync, L.scr_w / 2 - 25, 45);
+    lv_obj_align(btn_sync, LV_ALIGN_TOP_RIGHT, -20, L.title_y + 115);
+    lv_obj_set_style_bg_color(btn_sync, COL_ACCENT, 0);
+    lv_obj_add_event_cb(btn_sync, sync_click_cb, LV_EVENT_CLICKED, NULL);
+    lbl_btn_sync = lv_label_create(btn_sync);
+    lv_label_set_text(lbl_btn_sync, "Sync to PC");
+    lv_obj_set_style_text_font(lbl_btn_sync, &font_styrene_14, 0);
+    lv_obj_set_style_text_color(lbl_btn_sync, COL_TEXT, 0);
+    lv_obj_align(lbl_btn_sync, LV_ALIGN_CENTER, 0, 0);
+
+    // List of recordings
+    list_memos = lv_list_create(recorder_container);
+    lv_obj_set_size(list_memos, L.scr_w - 40, L.scr_h - L.title_y - 200);
+    lv_obj_align(list_memos, LV_ALIGN_TOP_MID, 0, L.title_y + 175);
+    lv_obj_set_style_bg_color(list_memos, lv_color_hex(0x1a1a24), 0);
+    lv_obj_set_style_border_width(list_memos, 1, 0);
+    lv_obj_set_style_border_color(list_memos, lv_color_hex(0x2d2d3d), 0);
+    lv_obj_set_style_pad_all(list_memos, 5, 0);
+
+    // Start UI update timer
+    rec_timer = lv_timer_create(recorder_timer_cb, 200, NULL);
+
+    lv_obj_add_flag(recorder_container, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void init_usage_screen(lv_obj_t* scr) {
     usage_container = lv_obj_create(scr);
     lv_obj_set_size(usage_container, L.scr_w, L.scr_h);
@@ -691,6 +1030,7 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_set_style_pad_all(usage_container, 0, 0);
     lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(usage_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(usage_container, usage_gesture_cb, LV_EVENT_GESTURE, NULL);
 
     lbl_title = lv_label_create(usage_container);
     lv_label_set_text(lbl_title, "Usage");
@@ -758,7 +1098,6 @@ static void init_usage_screen(lv_obj_t* scr) {
 
     build_approval_overlay(usage_container);
     build_wifi_modal(usage_container);
-    build_settings_modal(usage_container);
 }
 
 // ======== Public API ========
@@ -790,6 +1129,9 @@ void ui_init(void) {
     lv_image_set_src(battery_img, &battery_dscs[0]);
     lv_obj_set_pos(battery_img, L.scr_w - 48 - L.margin, L.title_y);
 
+    build_settings_shade(scr);
+    build_recorder_container(scr);
+    lv_obj_add_event_cb(scr, screen_gesture_cb, LV_EVENT_GESTURE, NULL);
 }
 
 void ui_update(const UsageData* data) {
@@ -805,10 +1147,45 @@ void ui_update(const UsageData* data) {
 
     static int prev_agent_state = 0;
     if (cur_data->agent_state == 2 && prev_agent_state != 2) {
-        #include "hal/sound_hal.h"
-        sound_hal_play_reset();
+        if (!settings_get_mute_permission()) {
+            sound_hal_play_reset();
+        }
     }
     prev_agent_state = cur_data->agent_state;
+
+    static bool prev_token_restored = false;
+    if (cur_data->token_restored && !prev_token_restored) {
+        if (!settings_get_mute_token()) {
+            sound_hal_play_reset();
+        }
+
+        // Show a custom premium forest green toast
+        lv_obj_t* toast = lv_obj_create(lv_screen_active());
+        lv_obj_set_size(toast, L.scr_w - 60, 60);
+        lv_obj_align(toast, LV_ALIGN_TOP_MID, 0, 80);
+        lv_obj_set_style_bg_color(toast, lv_color_hex(0x112b11), 0); // dark forest green
+        lv_obj_set_style_bg_opa(toast, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(toast, lv_color_hex(0x2a6b2a), 0); // green border
+        lv_obj_set_style_border_width(toast, 2, 0);
+        lv_obj_set_style_radius(toast, 12, 0);
+        lv_obj_clear_flag(toast, LV_OBJ_FLAG_SCROLLABLE);
+        
+        lv_obj_t* lbl = lv_label_create(toast);
+        lv_label_set_text(lbl, "Claude Token Restored!");
+        lv_obj_set_style_text_font(lbl, &font_styrene_16, 0);
+        lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
+        lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
+        
+        // Auto-delete timer
+        lv_timer_create([](lv_timer_t* t){
+            lv_obj_t* target = (lv_obj_t*)lv_timer_get_user_data(t);
+            if (lv_obj_is_valid(target)) {
+                lv_obj_delete(target);
+            }
+            lv_timer_delete(t);
+        }, 3500, toast);
+    }
+    prev_token_restored = cur_data->token_restored;
 
     if (approval_overlay) {
         if (cur_data->agent_state == 2) {

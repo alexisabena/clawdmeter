@@ -5,6 +5,10 @@
 #include <ArduinoJson.h>
 #include "net_server.h"
 #include "wifi_credentials.h"
+#include "sd_recorder.h"
+#ifdef BOARD_AMOLED_216
+#include <SD_MMC.h>
+#endif
 
 static WebServer server(80);
 static net_state_t state = NET_STATE_INIT;
@@ -15,6 +19,7 @@ static char daemon_url[128] = "";
 static char rx_buf[NET_BUF_SIZE];
 static volatile bool data_ready = false;
 static int approval_status = 0; // 0 = pending, 1 = allow_once, 2 = always_allow, 3 = deny
+static bool sync_requested = false;
 
 static void handle_approval() {
     String json_resp;
@@ -25,6 +30,58 @@ static void handle_approval() {
         default: json_resp = "{\"status\":\"pending\"}"; break;
     }
     server.send(200, "application/json", json_resp);
+}
+
+static void handle_get_recordings() {
+    if (!sd_recorder_is_sd_mounted()) {
+        server.send(500, "application/json", "{\"error\":\"SD card not mounted\"}");
+        return;
+    }
+    String history = sd_recorder_get_history_json();
+    server.send(200, "application/json", history);
+}
+
+static void handle_download_recording() {
+#ifdef BOARD_AMOLED_216
+    if (!sd_recorder_is_sd_mounted()) {
+        server.send(500, "text/plain", "SD card not mounted");
+        return;
+    }
+    if (!server.hasArg("file")) {
+        server.send(400, "text/plain", "Missing file parameter");
+        return;
+    }
+    String filename = server.arg("file");
+    String filepath = "/" + filename;
+    if (!SD_MMC.exists(filepath)) {
+        server.send(404, "text/plain", "File not found");
+        return;
+    }
+    File file = SD_MMC.open(filepath, FILE_READ);
+    if (!file) {
+        server.send(500, "text/plain", "Failed to open file");
+        return;
+    }
+    server.streamFile(file, "audio/wav");
+    file.close();
+#else
+    server.send(501, "text/plain", "SD card not supported");
+#endif
+}
+
+static void handle_uploaded_recording() {
+    if (!sd_recorder_is_sd_mounted()) {
+        server.send(500, "application/json", "{\"error\":\"SD card not mounted\"}");
+        return;
+    }
+    if (!server.hasArg("file")) {
+        server.send(400, "application/json", "{\"error\":\"Missing file parameter\"}");
+        return;
+    }
+    String filename = server.arg("file");
+    sd_recorder_set_uploaded(filename.c_str());
+    sd_recorder_delete_file(filename.c_str());
+    server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
 static void handle_payload() {
@@ -48,7 +105,11 @@ static void handle_payload() {
         }
     }
     
-    server.send(200, "application/json", "{\"status\":\"ok\"}");
+    String resp = "{\"status\":\"ok\"}";
+    if (sync_requested) {
+        resp = "{\"status\":\"ok\",\"sync\":true}";
+    }
+    server.send(200, "application/json", resp);
 }
 
 static bool using_home = true;
@@ -173,6 +234,9 @@ void net_tick(void) {
             if (!server_started) {
                 server.on("/api/payload", handle_payload);
                 server.on("/api/approval", handle_approval);
+                server.on("/api/recordings", handle_get_recordings);
+                server.on("/api/recordings/download", handle_download_recording);
+                server.on("/api/recordings/uploaded", handle_uploaded_recording);
                 server_started = true;
             }
             server.begin();
@@ -273,6 +337,15 @@ void net_set_approval_status(int status) {
 
 int net_get_approval_status(void) {
     return approval_status;
+}
+
+bool net_get_sync_requested(void) {
+    return sync_requested;
+}
+
+void net_set_sync_requested(bool req) {
+    sync_requested = req;
+    Serial.printf("Sync requested flag set: %s\n", req ? "true" : "false");
 }
 
 void net_request_refresh(void) {}

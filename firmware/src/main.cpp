@@ -12,6 +12,9 @@
 #include "idle.h"
 #include "idle_cfg.h"
 #include "brightness.h"
+#include "settings.h"
+#include "sd_recorder.h"
+#include <sys/time.h>
 
 #include "hal/board_caps.h"
 #include "hal/display_hal.h"
@@ -139,6 +142,13 @@ static bool parse_json(const char* json, UsageData* out) {
     strlcpy(out->reset_date, doc["rd"] | "", sizeof(out->reset_date));
     out->clock_epoch = doc["t"] | 0L;
     out->clock_fmt = doc["tf"] | 24;
+    if (out->clock_epoch > 0) {
+        struct timeval tv;
+        tv.tv_sec = out->clock_epoch;
+        tv.tv_usec = 0;
+        settimeofday(&tv, NULL);
+    }
+    out->token_restored = doc["tok_rst"] | false;
     out->ok = doc["ok"] | false;
     out->valid = true;
     return true;
@@ -219,6 +229,8 @@ void setup() {
     display_hal_begin();
     idle_init();        // takes over panel brightness and starts the idle timer
     brightness_init();  // load the user's saved brightness level and apply via idle
+    settings_init();    // load mute preferences
+    sd_recorder_init(); // mount SD Card
 
     power_hal_init();
     imu_hal_init();

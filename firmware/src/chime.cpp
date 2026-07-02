@@ -56,6 +56,14 @@ bool chime_init(const ChimeConfig& c) {
     return true;
 }
 
+void chime_deinit(void) {
+    if (ready) {
+        i2s.end();
+        ready = false;
+        Serial.println("chime: I2S deinitialized");
+    }
+}
+
 void chime_play(void) {
     if (!ready || playing) return;
     playing = true;

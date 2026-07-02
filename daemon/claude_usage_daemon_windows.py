@@ -475,11 +475,15 @@ async def poll_gemini_usage(api_key: str, project_id: str) -> dict | None:
     }
 
 
-def build_ble_payload(claude_payload: dict | None, gemini_payload: dict | None, agent_state: int = 0, agent_msg: str = "") -> dict:
+def build_ble_payload(claude_payload: dict | None, gemini_payload: dict | None, agent_state: int = 0, agent_msg: str = "", token_restored: bool = False) -> dict:
     payload = {"ok": False}
     payload["a_st"] = agent_state
     if agent_msg:
         payload["a_msg"] = agent_msg[:32]
+    
+    payload["t"] = int(time.time())
+    payload["tf"] = 24
+    payload["tok_rst"] = token_restored
 
     if claude_payload and claude_payload.get("ok"):
         payload["ok"] = True
@@ -536,6 +540,79 @@ def read_esp32_ip() -> str:
     return "clawdmeter.local"
 
 
+async def perform_sync(target_host: str) -> None:
+    log("Sync: starting sync process...")
+    repo_dir = Path(os.path.expanduser('~/.gemini/antigravity-ide/scratch/clawdmeter'))
+    recordings_dir = repo_dir / "recordings"
+    recordings_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            # 1. Fetch recordings list
+            list_url = f"http://{target_host}/api/recordings"
+            resp = await http.get(list_url)
+            if resp.status_code != 200:
+                log(f"Sync failed: GET /api/recordings returned {resp.status_code}")
+                return
+            
+            recordings = resp.json()
+            if not isinstance(recordings, list):
+                log("Sync failed: recordings list is not a JSON list")
+                return
+
+            synced_count = 0
+            for rec in recordings:
+                filename = rec.get("name")
+                uploaded = rec.get("uploaded", False)
+                if not filename or uploaded:
+                    continue
+
+                log(f"Sync: downloading {filename}...")
+                download_url = f"http://{target_host}/api/recordings/download?file={filename}"
+                
+                # Stream the download
+                temp_path = recordings_dir / filename
+                async with http.stream("GET", download_url) as r:
+                    if r.status_code != 200:
+                        log(f"Sync: failed to download {filename}, HTTP {r.status_code}")
+                        continue
+                    with open(temp_path, "wb") as f:
+                        async for chunk in r.aiter_bytes():
+                            f.write(chunk)
+                
+                log(f"Sync: marking {filename} as uploaded...")
+                ack_url = f"http://{target_host}/api/recordings/uploaded?file={filename}"
+                ack_resp = await http.post(ack_url)
+                if ack_resp.status_code == 200:
+                    synced_count += 1
+                else:
+                    log(f"Sync: failed to mark {filename} as uploaded, HTTP {ack_resp.status_code}")
+
+            if synced_count > 0:
+                log(f"Sync: successfully downloaded {synced_count} voice memos. Triggering Git commit & push...")
+                
+                def run_git(args):
+                    res = subprocess.run(args, cwd=str(repo_dir), capture_output=True, text=True, check=True)
+                    log(f"Git {' '.join(args)}: {res.stdout.strip()} {res.stderr.strip()}")
+
+                try:
+                    run_git(["git", "add", "recordings"])
+                    # Check if there are changes to commit
+                    status_res = subprocess.run(["git", "status", "--porcelain"], cwd=str(repo_dir), capture_output=True, text=True, check=True)
+                    if status_res.stdout.strip():
+                        run_git(["git", "commit", "-m", f"sync: upload {synced_count} voice memos"])
+                        run_git(["git", "push", "origin", "main"])
+                        log("Sync: git push completed successfully!")
+                    else:
+                        log("Sync: no changes to commit in git.")
+                except Exception as git_err:
+                    log(f"Sync: Git operation failed: {git_err}")
+            else:
+                log("Sync: no new recordings to download.")
+    except Exception as e:
+        log(f"Sync: exception during sync: {e}")
+
+
 async def main(tray_state=None) -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -569,6 +646,9 @@ async def main(tray_state=None) -> None:
     last_sent_agent_state = -1
     last_sent_agent_msg = ""
     
+    token_was_invalid = False
+    token_restored_flag = False
+    
     backoff = 1
     
     try:
@@ -599,12 +679,19 @@ async def main(tray_state=None) -> None:
                 claude_payload = None
                 if not token:
                     log("No Claude token; skipping Claude poll")
+                    token_was_invalid = True
                     if tray_state:
                         tray_state.set_error("token expired — run claude login")
                 else:
                     try:
                         claude_payload = await poll_api(token)
+                        if claude_payload and claude_payload.get("ok"):
+                            if token_was_invalid:
+                                log("Token restored! Preparing alert for ESP32.")
+                                token_restored_flag = True
+                                token_was_invalid = False
                     except AuthError:
+                        token_was_invalid = True
                         if tray_state:
                             tray_state.set_error("token expired — run claude login")
                         claude_payload = None
@@ -628,18 +715,36 @@ async def main(tray_state=None) -> None:
                 gemini_payload_cache = gemini_payload
                 last_poll = time.time()
 
-            payload = build_ble_payload(claude_payload_cache, gemini_payload_cache, agent_state, agent_msg)
+            payload = build_ble_payload(
+                claude_payload_cache, 
+                gemini_payload_cache, 
+                agent_state, 
+                agent_msg, 
+                token_restored=token_restored_flag
+            )
 
             target_host = read_esp32_ip()
             esp_url = f"http://{target_host}/api/payload"
 
-            if state_changed or elapsed >= POLL_INTERVAL or last_sent_agent_state == -1:
+            if state_changed or elapsed >= POLL_INTERVAL or last_sent_agent_state == -1 or token_restored_flag:
                 if payload.get("ok"):
                     log(f"Sending payload to ESP32: {payload} -> {esp_url}")
                     try:
                         async with httpx.AsyncClient(timeout=4.0) as http:
                             resp = await http.post(esp_url, json=payload)
                         if resp.status_code == 200:
+                            # Successfully sent; clear token_restored flag
+                            token_restored_flag = False
+                            
+                            # Check if sync requested
+                            try:
+                                resp_json = resp.json()
+                                if resp_json.get("sync"):
+                                    # Launch sync asynchronously
+                                    asyncio.create_task(perform_sync(target_host))
+                            except Exception as sync_check_err:
+                                pass
+
                             # Save active IP for approval hook discovery
                             try:
                                 ip_file = Path(os.path.expanduser('~/.claude/clawdmeter_ip.txt'))
